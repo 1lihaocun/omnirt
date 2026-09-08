@@ -75,6 +75,28 @@ The server sends a metrics event, then a video binary payload:
 b"VIDX" + uint32(frame_count) + repeated(uint32(jpeg_len) + jpeg_bytes)
 ```
 
+## QuickTalk performance diagnostics
+
+For benchmarks or debugging, set `OMNIRT_PERF_LOG=1` in the process hosting the QuickTalk runtime before starting the service as usual. Leaving it unset or setting it to `0` disables detailed per-chunk performance logs. When enabled, fast chunks and empty priming chunks are logged too, without the previous 200 ms slow-chunk threshold.
+
+`quicktalk_ws_chunk` covers `/v1/audio2video/quicktalk`, its `/v1/avatar/quicktalk` alias, and QuickTalk sessions on `/v1/avatar/realtime`. It emits one line after each successful VIDX send, retaining English field names with Chinese explanations:
+
+| Metric | Meaning and measurement boundary |
+|---|---|
+| `session_id` | Session identifier |
+| `chunk_index` | Chunk number returned by `service.push_audio_chunk()`, starting at 1 |
+| `lock_wait_ms` | Time from attempting to acquire the global `avatar_runtime_lock` until holding it |
+| `infer_ms` | Inference duration reused directly from the service's `metrics["infer_ms"]` |
+| `payload_bytes` | `len(video_payload)`, including the VIDX header and frame-length fields |
+| `ws_send_ms` | Time spent awaiting `websocket.send_bytes(video_payload)` only |
+| `server_total_ms` | Time from preparing to process the audio chunk until the binary send completes; includes lock wait, thread scheduling, inference, and sending, plus the existing metrics JSON send on the native route |
+
+All `*_ms` fields use milliseconds. `ws_send_ms` measures when the server-side send call returns, not client receipt or playback. `server_total_ms` excludes waiting to receive client audio.
+
+The same switch enables runtime `quicktalk_render_chunk` logs with `feature_ms` (feature extraction), `generate_ms` (video-frame generation), `encode_ms` (JPEG encoding), `total_ms` (total rendering duration), and `frames` (output frame count). The retained `session` field matches the server's `session_id`; `chunk` is the count of completed chunks at render time, corresponding to `chunk_index - 1` for normal audio chunks. Initialization warmup may also emit render logs without a WebSocket send.
+
+These logs stay on the server. They add no client messages or metrics fields and preserve VIDX bytes, message order, and session behavior. Proxy forwarding does not run inference locally; enable the switch in the service actually hosting the QuickTalk runtime.
+
 ## Control messages
 
 ```json

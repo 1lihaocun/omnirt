@@ -116,6 +116,28 @@ The server sends a metrics event, then a video binary payload:
 b"VIDX" + uint32(frame_count) + repeated(uint32(jpeg_len) + jpeg_bytes)
 ```
 
+## QuickTalk 性能诊断日志
+
+benchmark / debug 时，在运行 QuickTalk runtime 的服务进程中设置 `OMNIRT_PERF_LOG=1`，再按原有方式启动服务。未设置或设为 `0` 时关闭详细性能日志，不逐 chunk 输出；开启后快速 chunk 和空帧预热 chunk 也会记录，不受原先 200 ms 慢 chunk 门槛限制。
+
+`quicktalk_ws_chunk` 覆盖 `/v1/audio2video/quicktalk`、其 `/v1/avatar/quicktalk` 别名，以及 `/v1/avatar/realtime` 中的 QuickTalk session。每次成功发送 VIDX 后输出一行，保留英文指标名并附中文解释：
+
+| 指标 | 中文含义与计量范围 |
+|---|---|
+| `session_id` | 会话标识 |
+| `chunk_index` | 分块序号，直接使用 `service.push_audio_chunk()` 返回值，从 1 开始 |
+| `lock_wait_ms` | 锁等待耗时，从准备获取全局 `avatar_runtime_lock` 到实际持有锁 |
+| `infer_ms` | 推理耗时，直接使用服务返回的 `metrics["infer_ms"]` |
+| `payload_bytes` | 视频载荷字节数，等于 `len(video_payload)`，包含 VIDX 头及帧长度字段 |
+| `ws_send_ms` | WebSocket 发送耗时，仅计量 `await websocket.send_bytes(video_payload)` |
+| `server_total_ms` | 服务端总耗时，从准备处理音频 chunk 到二进制发送完成；包含锁等待、线程调度、推理和发送，原生路由还包含已有 metrics JSON 的发送 |
+
+所有 `*_ms` 均以毫秒计。`ws_send_ms` 衡量服务端发送调用返回所需时间，不代表客户端已接收或播放；`server_total_ms` 不包含等待接收客户端音频的时间。
+
+同一开关还启用 runtime 的 `quicktalk_render_chunk` 日志：`feature_ms`（特征提取）、`generate_ms`（视频帧生成）、`encode_ms`（JPEG 编码）、`total_ms`（渲染总耗时）及 `frames`（输出帧数）。保留的 `session` 对应服务层 `session_id`；`chunk` 是渲染时已完成的分块数，正常音频 chunk 对应服务层 `chunk_index - 1`。初始化预热也可能产生 render 日志，但不对应 WebSocket 发送。
+
+这些日志仅在服务端输出，不添加客户端消息或 metrics 字段，VIDX 二进制内容、原有消息顺序和 session 行为保持不变。代理转发入口不会在本进程执行推理，需要在实际承载 QuickTalk runtime 的服务中启用开关。
+
 ## Control messages
 
 ```json

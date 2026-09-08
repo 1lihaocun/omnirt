@@ -5,6 +5,9 @@ from __future__ import annotations
 import base64
 import asyncio
 import json
+import os
+import time
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -16,6 +19,14 @@ from omnirt.server.realtime_avatar import MAGIC_FRAME, MAGIC_VIDEO, RealtimeAvat
 router = APIRouter()
 
 FASTERLIVEPORTRAIT_MODEL_ID = "fasterliveportrait"
+
+
+@dataclass
+class _AudioChunkPerformance:
+    """Server-only timings; never merge these into the wire metrics."""
+
+    server_started: float = field(default_factory=lambda: time.perf_counter())
+    lock_wait_ms: float = 0.0
 
 
 def _avatar_runtime_lock(request_or_websocket: Request | WebSocket) -> asyncio.Lock:
@@ -31,9 +42,39 @@ async def _push_audio_chunk_async(
     service: Any,
     session_id: str,
     payload: bytes,
+    *,
+    performance: _AudioChunkPerformance | None = None,
 ) -> tuple[bytes, dict[str, object]]:
-    async with _avatar_runtime_lock(websocket):
+    lock = _avatar_runtime_lock(websocket)
+    lock_started = time.perf_counter() if performance is not None else 0.0
+    async with lock:
+        if performance is not None:
+            performance.lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
         return await asyncio.to_thread(service.push_audio_chunk, session_id, payload)
+
+
+async def _send_audio_chunk_async(
+    websocket: WebSocket,
+    session_id: str,
+    video_payload: bytes,
+    metrics: dict[str, object],
+    performance: _AudioChunkPerformance | None,
+) -> None:
+    send_started = time.perf_counter() if performance is not None else 0.0
+    await websocket.send_bytes(video_payload)
+    if performance is not None:
+        finished = time.perf_counter()
+        print(
+            "quicktalk_ws_chunk "
+            f"session_id={session_id}(会话标识) "
+            f"chunk_index={metrics['chunk_index']}(分块序号) "
+            f"lock_wait_ms={performance.lock_wait_ms:.3f}(锁等待耗时，毫秒) "
+            f"infer_ms={metrics['infer_ms']}(推理耗时，毫秒) "
+            f"payload_bytes={len(video_payload)}(视频载荷字节数) "
+            f"ws_send_ms={(finished - send_started) * 1000.0:.3f}(WebSocket发送耗时，毫秒) "
+            f"server_total_ms={(finished - performance.server_started) * 1000.0:.3f}(服务端总耗时，毫秒)",
+            flush=True,
+        )
 
 
 async def _push_video_frame_async(
@@ -538,12 +579,18 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
                 if session_id is None:
                     await websocket.send_json({"type": "error", "message": "No active session. Send 'init' first."})
                     continue
+                performance = (
+                    _AudioChunkPerformance()
+                    if model == "quicktalk" and os.environ.get("OMNIRT_PERF_LOG") == "1"
+                    else None
+                )
                 try:
-                    video_payload, _metrics = await _push_audio_chunk_async(
+                    video_payload, metrics = await _push_audio_chunk_async(
                         websocket,
                         service,
                         session_id,
                         message["bytes"],
+                        performance=performance,
                     )
                 except RealtimeAvatarError as exc:
                     await websocket.send_json({"type": "error", "message": str(exc), "code": exc.code})
@@ -551,7 +598,7 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
                 except Exception as exc:
                     await websocket.send_json(_runtime_error_payload(exc))
                     continue
-                await websocket.send_bytes(video_payload)
+                await _send_audio_chunk_async(websocket, session_id, video_payload, metrics, performance)
     except WebSocketDisconnect:
         pass
     finally:
@@ -840,12 +887,18 @@ async def native_realtime_avatar(websocket: WebSocket):
                         {"type": "error", "code": "session_required", "message": "Create a session before sending audio."}
                     )
                     continue
+                performance = (
+                    _AudioChunkPerformance()
+                    if session.model == "quicktalk" and os.environ.get("OMNIRT_PERF_LOG") == "1"
+                    else None
+                )
                 try:
                     video_payload, metrics = await _push_audio_chunk_async(
                         websocket,
                         service,
                         session_id,
                         message["bytes"],
+                        performance=performance,
                     )
                 except RealtimeAvatarError as exc:
                     await websocket.send_json(_error_payload(exc))
@@ -854,7 +907,7 @@ async def native_realtime_avatar(websocket: WebSocket):
                     await websocket.send_json(_runtime_error_payload(exc))
                     continue
                 await websocket.send_json(metrics)
-                await websocket.send_bytes(video_payload)
+                await _send_audio_chunk_async(websocket, session_id, video_payload, metrics, performance)
     except WebSocketDisconnect:
         pass
     finally:

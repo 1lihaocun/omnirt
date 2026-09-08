@@ -360,15 +360,15 @@ class QuickTalkRealtimeRuntime:
             frames.append(self._encode_jpeg_bgr(frame))
         encode_elapsed = time.perf_counter() - encode_started
         total_elapsed = time.perf_counter() - total_started
-        if total_elapsed >= 0.2 or session.chunk_index == 0:
+        if os.environ.get("OMNIRT_PERF_LOG") == "1":
             print(
                 "quicktalk_render_chunk "
-                f"session={session.session_id} chunk={session.chunk_index} "
-                f"samples={pcm.size} reps={len(reps)} frames={len(frames)} "
-                f"feature_ms={feature_elapsed * 1000.0:.1f} "
-                f"generate_ms={generate_elapsed * 1000.0:.1f} "
-                f"encode_ms={encode_elapsed * 1000.0:.1f} "
-                f"total_ms={total_elapsed * 1000.0:.1f}",
+                f"session={session.session_id}(会话标识) chunk={session.chunk_index}(已完成分块数) "
+                f"samples={pcm.size}(音频采样点数) reps={len(reps)}(特征数量) frames={len(frames)}(视频帧数) "
+                f"feature_ms={feature_elapsed * 1000.0:.1f}(音频特征提取耗时，毫秒) "
+                f"generate_ms={generate_elapsed * 1000.0:.1f}(视频帧生成耗时，毫秒) "
+                f"encode_ms={encode_elapsed * 1000.0:.1f}(JPEG编码耗时，毫秒) "
+                f"total_ms={total_elapsed * 1000.0:.1f}(渲染总耗时，毫秒)",
                 flush=True,
             )
         return frames
