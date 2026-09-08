@@ -120,19 +120,31 @@ b"VIDX" + uint32(frame_count) + repeated(uint32(jpeg_len) + jpeg_bytes)
 
 benchmark / debug 时，在运行 QuickTalk runtime 的服务进程中设置 `OMNIRT_PERF_LOG=1`，再按原有方式启动服务。未设置或设为 `0` 时关闭详细性能日志，不逐 chunk 输出；开启后快速 chunk 和空帧预热 chunk 也会记录，不受原先 200 ms 慢 chunk 门槛限制。
 
-`quicktalk_ws_chunk` 覆盖 `/v1/audio2video/quicktalk`、其 `/v1/avatar/quicktalk` 别名，以及 `/v1/avatar/realtime` 中的 QuickTalk session。每次成功发送 VIDX 后输出一行，采用空格分隔的英文 `key=value` 格式：
+`quicktalk_ws_chunk` 覆盖 `/v1/audio2video/quicktalk`、其 `/v1/avatar/quicktalk` 别名，以及 `/v1/avatar/realtime` 中的 QuickTalk session。每次 VIDX 的发送 await 成功返回后输出一行，采用空格分隔的英文 `key=value` 格式：
 
 | 指标 | 中文含义与计量范围 |
 |---|---|
 | `session_id` | 会话标识 |
 | `chunk_index` | 分块序号，直接使用 `service.push_audio_chunk()` 返回值，从 1 开始 |
+| `inter_chunk_gap_ms` | 分块间隔，上一次 VIDX 的 `send_bytes` await 成功返回，到当前 AUDI 的 `websocket.receive()` 返回时立即采样的时间差；首个 chunk 为 `null` |
 | `lock_wait_ms` | 锁等待耗时，从准备获取全局 `avatar_runtime_lock` 到实际持有锁 |
 | `infer_ms` | 推理耗时，直接使用服务返回的 `metrics["infer_ms"]` |
 | `payload_bytes` | 视频载荷字节数，等于 `len(video_payload)`，包含 VIDX 头及帧长度字段 |
-| `ws_send_ms` | WebSocket 发送耗时，仅计量 `await websocket.send_bytes(video_payload)` |
-| `server_total_ms` | 服务端总耗时，从准备处理音频 chunk 到二进制发送完成；包含锁等待、线程调度、推理和发送，原生路由还包含已有 metrics JSON 的发送 |
+| `ws_send_ms` | ASGI/WebSocket send await 耗时，仅计量 `await websocket.send_bytes(video_payload)` |
+| `server_total_ms` | 服务端总耗时，从准备处理音频 chunk 到二进制发送 await 返回；包含锁等待、线程调度、推理和发送，原生路由还包含已有 metrics JSON 的发送 |
 
-所有 `*_ms` 均以毫秒计。`ws_send_ms` 衡量服务端发送调用返回所需时间，不代表客户端已接收或播放；`server_total_ms` 不包含等待接收客户端音频的时间。
+所有 `*_ms` 均以毫秒计。`ws_send_ms` 是 ASGI/WebSocket send await duration，可能反映 socket 背压，但不代表远端应用已完整收到 payload，更不是公网完整传输耗时。`server_total_ms` 不包含等待接收客户端音频的时间，也不包含 `inter_chunk_gap_ms`。
+
+`inter_chunk_gap_ms` 使用 `time.perf_counter()` 计时，接收端点是 ASGI 应用收到完整 message 的时刻，不是网卡收到数据包的时刻。如果 AUDI 已在 ASGI 层排队，下一次 `receive()` 可能立即返回，间隔接近 0。该间隔可能包含期间的客户端发送节奏、网络、下游消费，以及服务端日志输出和事件循环调度；不能仅凭这个值区分根因，也不能将其当作纯网络 RTT。当前 chunk 的锁等待、推理和发送均不在这个间隔内。
+
+间隔仅在 QuickTalk 且 `OMNIRT_PERF_LOG=1` 时跟踪，由每个 WebSocket loop 为当前 session 独立维护。`init` / `session.create`、`close` / `session.close` 和原生路由的 `session.cancel` 会重置记录；断开连接后局部状态随 loop 退出清理。其他协议消息不更新上一次 VIDX 的发送完成时间。
+
+以下两行数值仅为示意；首个 chunk 无上一次成功发送记录，第二个 chunk 的分块间隔为 250 ms：
+
+```text
+quicktalk_ws_chunk session_id=example-session chunk_index=1 inter_chunk_gap_ms=null lock_wait_ms=1.000 infer_ms=80.0 payload_bytes=192000 ws_send_ms=8.000 server_total_ms=90.000
+quicktalk_ws_chunk session_id=example-session chunk_index=2 inter_chunk_gap_ms=250.000 lock_wait_ms=0.060 infer_ms=82.0 payload_bytes=198400 ws_send_ms=8.000 server_total_ms=90.560
+```
 
 同一开关还启用 runtime 的 `quicktalk_render_chunk` 日志：`feature_ms`（特征提取）、`generate_ms`（视频帧生成）、`encode_ms`（JPEG 编码）、`total_ms`（渲染总耗时）及 `frames`（输出帧数）。保留的 `session` 对应服务层 `session_id`；`chunk` 是渲染时已完成的分块数，正常音频 chunk 对应服务层 `chunk_index - 1`。初始化预热也可能产生 render 日志，但不对应 WebSocket 发送。
 

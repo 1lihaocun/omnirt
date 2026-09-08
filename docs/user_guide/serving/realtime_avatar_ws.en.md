@@ -79,19 +79,31 @@ b"VIDX" + uint32(frame_count) + repeated(uint32(jpeg_len) + jpeg_bytes)
 
 For benchmarks or debugging, set `OMNIRT_PERF_LOG=1` in the process hosting the QuickTalk runtime before starting the service as usual. Leaving it unset or setting it to `0` disables detailed per-chunk performance logs. When enabled, fast chunks and empty priming chunks are logged too, without the previous 200 ms slow-chunk threshold.
 
-`quicktalk_ws_chunk` covers `/v1/audio2video/quicktalk`, its `/v1/avatar/quicktalk` alias, and QuickTalk sessions on `/v1/avatar/realtime`. It emits one line after each successful VIDX send using space-separated English `key=value` fields:
+`quicktalk_ws_chunk` covers `/v1/audio2video/quicktalk`, its `/v1/avatar/quicktalk` alias, and QuickTalk sessions on `/v1/avatar/realtime`. It emits one line after each VIDX send await returns successfully, using space-separated English `key=value` fields:
 
 | Metric | Meaning and measurement boundary |
 |---|---|
 | `session_id` | Session identifier |
 | `chunk_index` | Chunk number returned by `service.push_audio_chunk()`, starting at 1 |
+| `inter_chunk_gap_ms` | Time from the previous successful VIDX `send_bytes` await return to the timestamp captured immediately after `websocket.receive()` returns the current AUDI message; `null` for the first chunk |
 | `lock_wait_ms` | Time from attempting to acquire the global `avatar_runtime_lock` until holding it |
 | `infer_ms` | Inference duration reused directly from the service's `metrics["infer_ms"]` |
 | `payload_bytes` | `len(video_payload)`, including the VIDX header and frame-length fields |
-| `ws_send_ms` | Time spent awaiting `websocket.send_bytes(video_payload)` only |
-| `server_total_ms` | Time from preparing to process the audio chunk until the binary send completes; includes lock wait, thread scheduling, inference, and sending, plus the existing metrics JSON send on the native route |
+| `ws_send_ms` | ASGI/WebSocket send await duration, measuring only `await websocket.send_bytes(video_payload)` |
+| `server_total_ms` | Time from preparing to process the audio chunk until the binary send await returns; includes lock wait, thread scheduling, inference, and sending, plus the existing metrics JSON send on the native route |
 
-All `*_ms` fields use milliseconds. `ws_send_ms` measures when the server-side send call returns, not client receipt or playback. `server_total_ms` excludes waiting to receive client audio.
+All `*_ms` fields use milliseconds. `ws_send_ms` is an ASGI/WebSocket send await duration. It may reflect socket backpressure, but does not mean the remote application has received the complete payload and does not measure full public-network transfer time. `server_total_ms` excludes waiting to receive client audio and excludes `inter_chunk_gap_ms`.
+
+`inter_chunk_gap_ms` uses `time.perf_counter()`. Its receive boundary is when the ASGI application receives a complete message, not when a packet arrives at the network interface. If AUDI is already queued in ASGI, the next `receive()` may return immediately and the gap may be near zero. The gap can include client pacing, network delays, downstream consumption, server log output, and event-loop scheduling during that interval. This value alone cannot distinguish those causes and is not a pure network RTT measurement. The current chunk's lock wait, inference, and send are outside this interval.
+
+The gap is tracked only for QuickTalk with `OMNIRT_PERF_LOG=1`, using local state in each WebSocket loop for its current session. `init` / `session.create`, `close` / `session.close`, and native `session.cancel` reset this state; disconnecting discards the local state when the loop exits. Other protocol messages do not update the previous VIDX send completion time.
+
+The values below are illustrative. The first chunk has no previous successful send, and the second chunk has a 250 ms gap:
+
+```text
+quicktalk_ws_chunk session_id=example-session chunk_index=1 inter_chunk_gap_ms=null lock_wait_ms=1.000 infer_ms=80.0 payload_bytes=192000 ws_send_ms=8.000 server_total_ms=90.000
+quicktalk_ws_chunk session_id=example-session chunk_index=2 inter_chunk_gap_ms=250.000 lock_wait_ms=0.060 infer_ms=82.0 payload_bytes=198400 ws_send_ms=8.000 server_total_ms=90.560
+```
 
 The same switch enables runtime `quicktalk_render_chunk` logs with `feature_ms` (feature extraction), `generate_ms` (video-frame generation), `encode_ms` (JPEG encoding), `total_ms` (total rendering duration), and `frames` (output frame count). The retained `session` field matches the server's `session_id`; `chunk` is the count of completed chunks at render time, corresponding to `chunk_index - 1` for normal audio chunks. Initialization warmup may also emit render logs without a WebSocket send.
 

@@ -27,6 +27,7 @@ class _AudioChunkPerformance:
 
     server_started: float = field(default_factory=lambda: time.perf_counter())
     lock_wait_ms: float = 0.0
+    inter_chunk_gap_ms: float | None = None
 
 
 def _avatar_runtime_lock(request_or_websocket: Request | WebSocket) -> asyncio.Lock:
@@ -59,15 +60,24 @@ async def _send_audio_chunk_async(
     video_payload: bytes,
     metrics: dict[str, object],
     performance: _AudioChunkPerformance | None,
-) -> None:
+) -> float | None:
+    # ASGI/WebSocket send await duration may reflect socket backpressure;
+    # it does not mean the remote application has received the full payload.
     send_started = time.perf_counter() if performance is not None else 0.0
     await websocket.send_bytes(video_payload)
     if performance is not None:
+        # Capture completion before logging; the next receive gap starts here.
         finished = time.perf_counter()
+        gap_ms = (
+            f"{performance.inter_chunk_gap_ms:.3f}"
+            if performance.inter_chunk_gap_ms is not None
+            else "null"
+        )
         print(
             "quicktalk_ws_chunk "
             f"session_id={session_id} "
             f"chunk_index={metrics['chunk_index']} "
+            f"inter_chunk_gap_ms={gap_ms} "
             f"lock_wait_ms={performance.lock_wait_ms:.3f} "
             f"infer_ms={metrics['infer_ms']} "
             f"payload_bytes={len(video_payload)} "
@@ -75,6 +85,8 @@ async def _send_audio_chunk_async(
             f"server_total_ms={(finished - performance.server_started) * 1000.0:.3f}",
             flush=True,
         )
+        return finished
+    return None
 
 
 async def _push_video_frame_async(
@@ -462,9 +474,18 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
     await websocket.accept()
     service = websocket.app.state.realtime_avatar_service
     session_id: str | None = None
+    # Connection-local state, reset when its avatar session is replaced/closed;
+    # leaving this loop on disconnect discards it without touching other sessions.
+    last_chunk_send_finished_at: float | None = None
     try:
         while True:
             message = await websocket.receive()
+            # Application receive time, before dispatch, lock wait, or inference.
+            received_at = (
+                time.perf_counter()
+                if model == "quicktalk" and os.environ.get("OMNIRT_PERF_LOG") == "1"
+                else None
+            )
             if message.get("type") == "websocket.disconnect":
                 break
             if "text" in message and message["text"] is not None:
@@ -475,6 +496,7 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
                     continue
                 msg_type = payload.get("type")
                 if msg_type == "init":
+                    last_chunk_send_finished_at = None
                     if session_id is not None:
                         service.close_session(session_id)
                         session_id = None
@@ -550,6 +572,7 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
                         }
                     )
                 elif msg_type == "close":
+                    last_chunk_send_finished_at = None
                     if session_id is not None:
                         service.close_session(session_id)
                         session_id = None
@@ -580,8 +603,14 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
                     await websocket.send_json({"type": "error", "message": "No active session. Send 'init' first."})
                     continue
                 performance = (
-                    _AudioChunkPerformance()
-                    if model == "quicktalk" and os.environ.get("OMNIRT_PERF_LOG") == "1"
+                    _AudioChunkPerformance(
+                        inter_chunk_gap_ms=(
+                            (received_at - last_chunk_send_finished_at) * 1000.0
+                            if last_chunk_send_finished_at is not None
+                            else None
+                        ),
+                    )
+                    if received_at is not None
                     else None
                 )
                 try:
@@ -598,7 +627,9 @@ async def _flashtalk_compatible_loop(websocket: WebSocket, *, model: str) -> Non
                 except Exception as exc:
                     await websocket.send_json(_runtime_error_payload(exc))
                     continue
-                await _send_audio_chunk_async(websocket, session_id, video_payload, metrics, performance)
+                last_chunk_send_finished_at = await _send_audio_chunk_async(
+                    websocket, session_id, video_payload, metrics, performance
+                )
     except WebSocketDisconnect:
         pass
     finally:
@@ -822,9 +853,19 @@ async def native_realtime_avatar(websocket: WebSocket):
     await websocket.accept()
     service = websocket.app.state.realtime_avatar_service
     session_id: str | None = None
+    # Keep the timeline local to this connection and reset it with session control.
+    last_chunk_send_finished_at: float | None = None
     try:
         while True:
             message = await websocket.receive()
+            # ASGI receive completion, not the arrival time at the network socket.
+            received_at = (
+                time.perf_counter()
+                if session_id is not None
+                and session.model == "quicktalk"
+                and os.environ.get("OMNIRT_PERF_LOG") == "1"
+                else None
+            )
             if message.get("type") == "websocket.disconnect":
                 break
             if "text" in message and message["text"] is not None:
@@ -835,6 +876,7 @@ async def native_realtime_avatar(websocket: WebSocket):
                     continue
                 msg_type = payload.get("type")
                 if msg_type == "session.create":
+                    last_chunk_send_finished_at = None
                     if session_id is not None:
                         service.close_session(session_id)
                         session_id = None
@@ -867,10 +909,12 @@ async def native_realtime_avatar(websocket: WebSocket):
                     session_id = session.session_id
                     await websocket.send_json({"type": "session.created", **session.metadata(include_paths=False)})
                 elif msg_type == "session.cancel":
+                    last_chunk_send_finished_at = None
                     if session_id is not None:
                         service.cancel_session(session_id)
                     await websocket.send_json({"type": "session.cancelled", "session_id": session_id})
                 elif msg_type == "session.close":
+                    last_chunk_send_finished_at = None
                     if session_id is not None:
                         service.close_session(session_id)
                     await websocket.send_json({"type": "session.closed", "session_id": session_id})
@@ -888,8 +932,14 @@ async def native_realtime_avatar(websocket: WebSocket):
                     )
                     continue
                 performance = (
-                    _AudioChunkPerformance()
-                    if session.model == "quicktalk" and os.environ.get("OMNIRT_PERF_LOG") == "1"
+                    _AudioChunkPerformance(
+                        inter_chunk_gap_ms=(
+                            (received_at - last_chunk_send_finished_at) * 1000.0
+                            if last_chunk_send_finished_at is not None
+                            else None
+                        ),
+                    )
+                    if received_at is not None
                     else None
                 )
                 try:
@@ -907,7 +957,9 @@ async def native_realtime_avatar(websocket: WebSocket):
                     await websocket.send_json(_runtime_error_payload(exc))
                     continue
                 await websocket.send_json(metrics)
-                await _send_audio_chunk_async(websocket, session_id, video_payload, metrics, performance)
+                last_chunk_send_finished_at = await _send_audio_chunk_async(
+                    websocket, session_id, video_payload, metrics, performance
+                )
     except WebSocketDisconnect:
         pass
     finally:
