@@ -159,12 +159,13 @@ def test_quicktalk_perf_log_records_every_fast_chunk_without_changing_vidx_paylo
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 2
     for chunk_index, line in zip((1, 2), lines):
+        assert line.isascii()
         assert line == (
             "quicktalk_render_chunk "
-            f"session=perf-session(会话标识) chunk={chunk_index}(已完成分块数) "
-            "samples=4(音频采样点数) reps=1(特征数量) frames=1(视频帧数) "
-            "feature_ms=1.0(音频特征提取耗时，毫秒) "
-            "generate_ms=1.0(视频帧生成耗时，毫秒) "
-            "encode_ms=1.0(JPEG编码耗时，毫秒) "
-            "total_ms=7.0(渲染总耗时，毫秒)"
+            f"session=perf-session chunk={chunk_index} "
+            "samples=4 reps=1 frames=1 "
+            "feature_ms=1.0 "
+            "generate_ms=1.0 "
+            "encode_ms=1.0 "
+            "total_ms=7.0"
         )

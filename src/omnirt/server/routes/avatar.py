@@ -66,13 +66,13 @@ async def _send_audio_chunk_async(
         finished = time.perf_counter()
         print(
             "quicktalk_ws_chunk "
-            f"session_id={session_id}(会话标识) "
-            f"chunk_index={metrics['chunk_index']}(分块序号) "
-            f"lock_wait_ms={performance.lock_wait_ms:.3f}(锁等待耗时，毫秒) "
-            f"infer_ms={metrics['infer_ms']}(推理耗时，毫秒) "
-            f"payload_bytes={len(video_payload)}(视频载荷字节数) "
-            f"ws_send_ms={(finished - send_started) * 1000.0:.3f}(WebSocket发送耗时，毫秒) "
-            f"server_total_ms={(finished - performance.server_started) * 1000.0:.3f}(服务端总耗时，毫秒)",
+            f"session_id={session_id} "
+            f"chunk_index={metrics['chunk_index']} "
+            f"lock_wait_ms={performance.lock_wait_ms:.3f} "
+            f"infer_ms={metrics['infer_ms']} "
+            f"payload_bytes={len(video_payload)} "
+            f"ws_send_ms={(finished - send_started) * 1000.0:.3f} "
+            f"server_total_ms={(finished - performance.server_started) * 1000.0:.3f}",
             flush=True,
         )
 

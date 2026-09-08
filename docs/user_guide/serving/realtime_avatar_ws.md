@@ -120,7 +120,7 @@ b"VIDX" + uint32(frame_count) + repeated(uint32(jpeg_len) + jpeg_bytes)
 
 benchmark / debug 时，在运行 QuickTalk runtime 的服务进程中设置 `OMNIRT_PERF_LOG=1`，再按原有方式启动服务。未设置或设为 `0` 时关闭详细性能日志，不逐 chunk 输出；开启后快速 chunk 和空帧预热 chunk 也会记录，不受原先 200 ms 慢 chunk 门槛限制。
 
-`quicktalk_ws_chunk` 覆盖 `/v1/audio2video/quicktalk`、其 `/v1/avatar/quicktalk` 别名，以及 `/v1/avatar/realtime` 中的 QuickTalk session。每次成功发送 VIDX 后输出一行，保留英文指标名并附中文解释：
+`quicktalk_ws_chunk` 覆盖 `/v1/audio2video/quicktalk`、其 `/v1/avatar/quicktalk` 别名，以及 `/v1/avatar/realtime` 中的 QuickTalk session。每次成功发送 VIDX 后输出一行，采用空格分隔的英文 `key=value` 格式：
 
 | 指标 | 中文含义与计量范围 |
 |---|---|

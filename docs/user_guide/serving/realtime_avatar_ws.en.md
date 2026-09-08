@@ -79,7 +79,7 @@ b"VIDX" + uint32(frame_count) + repeated(uint32(jpeg_len) + jpeg_bytes)
 
 For benchmarks or debugging, set `OMNIRT_PERF_LOG=1` in the process hosting the QuickTalk runtime before starting the service as usual. Leaving it unset or setting it to `0` disables detailed per-chunk performance logs. When enabled, fast chunks and empty priming chunks are logged too, without the previous 200 ms slow-chunk threshold.
 
-`quicktalk_ws_chunk` covers `/v1/audio2video/quicktalk`, its `/v1/avatar/quicktalk` alias, and QuickTalk sessions on `/v1/avatar/realtime`. It emits one line after each successful VIDX send, retaining English field names with Chinese explanations:
+`quicktalk_ws_chunk` covers `/v1/audio2video/quicktalk`, its `/v1/avatar/quicktalk` alias, and QuickTalk sessions on `/v1/avatar/realtime`. It emits one line after each successful VIDX send using space-separated English `key=value` fields:
 
 | Metric | Meaning and measurement boundary |
 |---|---|

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -81,10 +80,12 @@ def _perf_lines(output: str) -> list[str]:
 
 
 def _perf_fields(line: str) -> dict[str, str]:
-    fields = re.findall(r"(\w+)=([^\s(]+)\(([^)]+)\)", line)
-    assert {key for key, _, _ in fields} == _PERF_KEYS
-    assert all(re.search(r"[\u4e00-\u9fff]", translation) for _, _, translation in fields)
-    return {key: value for key, value, _ in fields}
+    assert line.isascii()
+    prefix, *items = line.split(" ")
+    assert prefix == "quicktalk_ws_chunk"
+    fields = dict(item.split("=", 1) for item in items)
+    assert set(fields) == _PERF_KEYS
+    return fields
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["compatible", "native"])
