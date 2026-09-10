@@ -6,13 +6,18 @@ Same wire protocol as ``model_backends/wav2lip/wav2lip_ws_server.py`` / SoulX Fl
 OpenTalking can use the same OmniRT audio2video client path for MuseTalk.
 
 Inference is intentionally OmniRT-side. This service imports the upstream MuseTalk source tree,
-loads the MuseTalk v1.5 weights, and exposes a FlashTalk-compatible WebSocket. OpenTalking stays
+loads MuseTalk v1 (default) or v1.5 weights, and exposes a FlashTalk-compatible WebSocket. OpenTalking stays
 as orchestration/client code only.
 
 Environment (high level):
   OMNIRT_MUSETALK_REPO              MuseTalk source checkout (default: <OMNIRT_HOME>/model-repos/MuseTalk)
   OMNIRT_MUSETALK_MODELS_DIR        Weight tree root (default: <omnirt>/models) — also sets
                                     MuseTalk model paths during loading.
+  OMNIRT_MUSETALK_VERSION           v1 | v15 (default v1)
+  OMNIRT_MUSETALK_WHISPER_DIR       v15 HF whisper-tiny directory (default /models/whisper-hf)
+  OMNIRT_MUSETALK_EXTRA_MARGIN      v15 lower face crop margin (default 10); bbox_shift is always 0
+  OMNIRT_MUSETALK_PARSING_MODE      v15 face parsing mode (default jaw)
+  OMNIRT_MUSETALK_LEFT_CHEEK_WIDTH / RIGHT_CHEEK_WIDTH  v15 parsing widths (default 90 each)
   OMNIRT_MUSETALK_DEVICE            auto | npu | npu:0 | cuda | cpu (default auto)
   OMNIRT_MUSETALK_NPU_INDEX         used when DEVICE=npu (default 0)
   OMNIRT_MUSETALK_HOST / PORT       bind (defaults 0.0.0.0:8766)
@@ -110,15 +115,47 @@ def _require_dir(path: Path, label: str) -> Path:
     return path
 
 
-def _check_model_layout(models_dir: Path) -> None:
-    _require_file(models_dir / "musetalk" / "pytorch_model.bin", "MuseTalk UNet weights")
-    _require_file(models_dir / "musetalk" / "musetalk.json", "MuseTalk UNet config")
+def _musetalk_version() -> str:
+    version = os.environ.get("OMNIRT_MUSETALK_VERSION", "v1").strip().lower()
+    if version not in {"v1", "v15"}:
+        raise RuntimeError(f"Invalid OMNIRT_MUSETALK_VERSION={version!r}; expected v1 or v15")
+    return version
+
+
+def _whisper_dir() -> Path:
+    return Path(os.environ.get("OMNIRT_MUSETALK_WHISPER_DIR", "/models/whisper-hf")).expanduser().resolve()
+
+
+def _unet_paths(models_dir: Path, version: str) -> tuple[Path, Path]:
+    if version == "v15":
+        return models_dir / "musetalkV15" / "musetalk.json", models_dir / "musetalkV15" / "unet.pth"
+    return models_dir / "musetalk" / "musetalk.json", models_dir / "musetalk" / "pytorch_model.bin"
+
+
+def _check_model_layout(
+    models_dir: Path, version: str | None = None, whisper_dir: Path | None = None,
+) -> None:
+    version = _musetalk_version() if version is None else version
+    unet_config, unet_weights = _unet_paths(models_dir, version)
+    _require_file(unet_weights, f"MuseTalk {version} UNet weights")
+    _require_file(unet_config, f"MuseTalk {version} UNet config")
     _require_dir(models_dir / "sd-vae-ft-mse", "MuseTalk VAE directory")
     _require_file(
         models_dir / "sd-vae-ft-mse" / "diffusion_pytorch_model.bin",
         "MuseTalk VAE weights",
     )
-    _require_file(models_dir / "whisper" / "tiny.pt", "Whisper tiny checkpoint")
+    if version == "v15":
+        whisper_dir = _whisper_dir() if whisper_dir is None else whisper_dir
+        _require_dir(whisper_dir, "MuseTalk v15 HF Whisper directory (OMNIRT_MUSETALK_WHISPER_DIR)")
+        _require_file(whisper_dir / "config.json", "MuseTalk v15 HF Whisper config")
+        _require_file(whisper_dir / "preprocessor_config.json", "MuseTalk v15 HF Whisper feature extractor config")
+        if not any((whisper_dir / name).is_file() for name in ("model.safetensors", "pytorch_model.bin")):
+            raise RuntimeError(
+                f"Missing MuseTalk v15 HF Whisper weights: {whisper_dir} "
+                "(expected model.safetensors or pytorch_model.bin; whisper/tiny.pt is v1 only)"
+            )
+    else:
+        _require_file(models_dir / "whisper" / "tiny.pt", "Whisper tiny checkpoint")
     _require_file(models_dir / "dwpose" / "dw-ll_ucoco_384.pth", "DWPose checkpoint")
     _require_file(models_dir / "face-parse-bisenet" / "79999_iter.pth", "face parsing checkpoint")
     _ensure_face_parse_resnet(models_dir)
@@ -141,7 +178,9 @@ def _ensure_face_parse_resnet(models_dir: Path) -> Path:
     return _require_file(target, "face parsing ResNet18 checkpoint")
 
 
-def _prepare_repo_model_links(repo: Path, models_dir: Path) -> None:
+def _prepare_repo_model_links(
+    repo: Path, models_dir: Path, version: str | None = None, whisper_dir: Path | None = None,
+) -> None:
     """Make upstream MuseTalk hard-coded ./models paths resolve to OmniRT's model root.
 
     Several upstream helpers keep default paths such as ./models/dwpose/... and
@@ -150,15 +189,20 @@ def _prepare_repo_model_links(repo: Path, models_dir: Path) -> None:
     """
     repo_models = repo / "models"
     repo_models.mkdir(parents=True, exist_ok=True)
+    version = _musetalk_version() if version is None else version
     links = {
-        "musetalk": models_dir / "musetalk",
         "sd-vae-ft-mse": models_dir / "sd-vae-ft-mse",
-        "whisper": models_dir / "whisper",
         "dwpose": models_dir / "dwpose",
         # Upstream misspells this directory as "bisent"; OpenTalking/OmniRT
         # model layout uses the clearer "bisenet".
         "face-parse-bisent": models_dir / "face-parse-bisenet",
     }
+    if version == "v15":
+        links["musetalkV15"] = models_dir / "musetalkV15"
+        links["whisper-hf"] = _whisper_dir() if whisper_dir is None else whisper_dir
+    else:
+        links["musetalk"] = models_dir / "musetalk"
+        links["whisper"] = models_dir / "whisper"
     for name, target in links.items():
         _require_dir(target, f"MuseTalk model directory {name}")
         link = repo_models / name
@@ -391,13 +435,19 @@ def _patch_torch_load_weights_only() -> None:
 
 class MuseTalkRuntime:
     def __init__(self) -> None:
+        self.version = _musetalk_version()
+        LOG.info("MuseTalk version=%s", self.version)
         self.repo = _inject_musetalk_repo()
         self.models_dir = _models_dir()
-        _check_model_layout(self.models_dir)
-        _prepare_repo_model_links(self.repo, self.models_dir)
+        self.whisper_dir = _whisper_dir() if self.version == "v15" else None
+        _check_model_layout(self.models_dir, self.version, self.whisper_dir)
+        _prepare_repo_model_links(self.repo, self.models_dir, self.version, self.whisper_dir)
         self.device = torch.device(_inference_device_str())
         self.batch_size = max(1, int(os.environ.get("OMNIRT_MUSETALK_BATCH_SIZE", "4")))
-        self.bbox_shift = int(os.environ.get("OMNIRT_MUSETALK_BBOX_SHIFT", "0"))
+        self.bbox_shift = 0 if self.version == "v15" else int(os.environ.get("OMNIRT_MUSETALK_BBOX_SHIFT", "0"))
+        if self.version == "v15":
+            self.extra_margin = int(os.environ.get("OMNIRT_MUSETALK_EXTRA_MARGIN", "10"))
+            self.parsing_mode = os.environ.get("OMNIRT_MUSETALK_PARSING_MODE", "jaw")
         self.audio_context_samples = max(
             0,
             int(os.environ.get("OMNIRT_MUSETALK_AUDIO_CONTEXT_SAMPLES", str(SAMPLE_RATE))),
@@ -406,28 +456,38 @@ class MuseTalkRuntime:
         self.unet: Any = None
         self.pe: Any = None
         self.audio_processor: Any = None
+        self.whisper: Any = None
         self.face_parser: Any = None
         self._load()
 
     def _load(self) -> None:
         os.environ.setdefault("FFMPEG_PATH", str(self.repo / "ffmpeg-6.1-amd64-static"))
         _patch_torch_load_weights_only()
-        _patch_openai_whisper_torch_load()
+        if self.version == "v1":
+            _patch_openai_whisper_torch_load()
         with _temporary_cwd(self.repo):
             from musetalk.models.unet import PositionalEncoding, UNet
             from musetalk.models.vae import VAE
             from musetalk.utils.face_parsing import FaceParsing
-            from musetalk.whisper.audio2feature import Audio2Feature
+            if self.version == "v1":
+                from musetalk.whisper.audio2feature import Audio2Feature
 
-            self.audio_processor = Audio2Feature(model_path=str(self.models_dir / "whisper" / "tiny.pt"))
+                self.audio_processor = Audio2Feature(model_path=str(self.models_dir / "whisper" / "tiny.pt"))
             self.vae = VAE(model_path=str(self.models_dir / "sd-vae-ft-mse"))
+            unet_config, unet_weights = _unet_paths(self.models_dir, self.version)
             self.unet = UNet(
-                unet_config=str(self.models_dir / "musetalk" / "musetalk.json"),
-                model_path=str(self.models_dir / "musetalk" / "pytorch_model.bin"),
+                unet_config=str(unet_config),
+                model_path=str(unet_weights),
                 device=self.device,
             )
             self.pe = PositionalEncoding(d_model=384)
-            self.face_parser = FaceParsing()
+            if self.version == "v15":
+                self.face_parser = FaceParsing(
+                    left_cheek_width=int(os.environ.get("OMNIRT_MUSETALK_LEFT_CHEEK_WIDTH", "90")),
+                    right_cheek_width=int(os.environ.get("OMNIRT_MUSETALK_RIGHT_CHEEK_WIDTH", "90")),
+                )
+            else:
+                self.face_parser = FaceParsing()
 
         self.pe = self.pe.to(self.device).half()
         self.vae.vae = self.vae.vae.to(self.device).half()
@@ -435,6 +495,15 @@ class MuseTalkRuntime:
         self.unet.device = self.device
         self.unet.model.eval()
         self.vae.vae.eval()
+        if self.version == "v15":
+            # Official realtime_inference.py at 0a89dec45a0192b824e3cf4daf96c239440c5ed8.
+            from musetalk.utils.audio_processor import AudioProcessor
+            from transformers import WhisperModel
+
+            self.audio_processor = AudioProcessor(feature_extractor_path=str(self.whisper_dir))
+            self.whisper = WhisperModel.from_pretrained(str(self.whisper_dir))
+            self.whisper = self.whisper.to(device=self.device, dtype=self.unet.model.dtype).eval()
+            self.whisper.requires_grad_(False)
         LOG.info("Loaded MuseTalk runtime repo=%s models=%s device=%s", self.repo, self.models_dir, self.device)
 
     def prepare_session(self, base_frame: np.ndarray) -> MuseTalkSessionState:
@@ -455,6 +524,10 @@ class MuseTalkRuntime:
                     x1, y1, x2, y2 = [int(v) for v in face_box]
                     working_frame = frames[0].copy()
                 except ModuleNotFoundError as exc:
+                    if self.version == "v15":
+                        raise RuntimeError(
+                            f"MuseTalk v15 requires upstream landmark preprocessing; missing dependency: {exc.name}"
+                        ) from exc
                     LOG.warning(
                         "MuseTalk preprocessing fallback: optional dependency missing (%s), "
                         "using SFD-only face box detection",
@@ -462,6 +535,8 @@ class MuseTalkRuntime:
                     )
                     x1, y1, x2, y2 = _detect_face_box_fallback(self.repo, image_path)
                     working_frame = frame.copy()
+            if self.version == "v15":
+                y2 = min(y2 + self.extra_margin, working_frame.shape[0])
             crop_frame = working_frame[y1:y2, x1:x2]
             if crop_frame.size == 0:
                 raise RuntimeError(f"MuseTalk face crop is empty: {(x1, y1, x2, y2)}")
@@ -486,6 +561,13 @@ class MuseTalkRuntime:
         upper_boundary_ratio: float = 0.5,
         expand: float = 1.2,
     ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        if self.version == "v15":
+            with _temporary_cwd(self.repo):
+                from musetalk.utils.blending import get_image_prepare_material
+
+                # Use upstream's v1.5 mask, including its default expand=1.5.
+                return get_image_prepare_material(image, face_box, fp=self.face_parser, mode=self.parsing_mode)
+
         from PIL import Image
 
         with _temporary_cwd(self.repo):
@@ -540,17 +622,35 @@ class MuseTalkRuntime:
             import soundfile as sf
 
             sf.write(wav.name, audio_for_features.astype(np.float32) / 32768.0, SAMPLE_RATE)
-            features = self.audio_processor.audio2feat(wav.name)
+            if self.version == "v15":
+                with torch.no_grad():
+                    features, audio_length = self.audio_processor.get_audio_feature(
+                        wav.name, weight_dtype=self.unet.model.dtype,
+                    )
+                    chunks = list(self.audio_processor.get_whisper_chunk(
+                        features,
+                        self.device,
+                        self.unet.model.dtype,
+                        self.whisper,
+                        audio_length,
+                        fps=fps,
+                        audio_padding_length_left=2,
+                        audio_padding_length_right=2,
+                    ))
+            else:
+                features = self.audio_processor.audio2feat(wav.name)
 
         context_frames = int(round(context_samples * fps / SAMPLE_RATE))
         start_frame = max(0, context_frames)
-        chunks = self.audio_processor.feature2chunks(features, fps=fps)
+        if self.version == "v1":
+            chunks = self.audio_processor.feature2chunks(features, fps=fps)
         chunks = chunks[start_frame : start_frame + slice_len]
         if not chunks:
             raise RuntimeError("MuseTalk audio feature extraction produced zero chunks")
         while len(chunks) < slice_len:
             chunks.append(chunks[-1])
-        chunks = [torch.from_numpy(np.asarray(chunk)).float() for chunk in chunks]
+        if self.version == "v1":
+            chunks = [torch.from_numpy(np.asarray(chunk)).float() for chunk in chunks]
 
         frames: list[np.ndarray] = []
         timesteps = torch.tensor([0], device=self.device)
@@ -828,6 +928,11 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args, _unknown = build_arg_parser().parse_known_args(argv)
+    try:
+        LOG.info("MuseTalk version=%s", _musetalk_version())
+    except RuntimeError as exc:
+        LOG.error("%s", exc)
+        return 1
     fn, mn, sl = _slice_params()
     LOG.info(
         "Protocol: frame_num=%d motion=%d slice_len=%d fps=%d chunk_samples=%d",

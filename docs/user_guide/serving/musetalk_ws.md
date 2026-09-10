@@ -66,7 +66,7 @@ pip install -r model_backends/musetalk/requirements-musetalk-ascend.txt
 
 - **MuseTalk 源码**：推荐执行 `omnirt runtime install musetalk --device npu`，默认克隆到 `${OMNIRT_HOME}/model-repos/MuseTalk`。
 - **权重根目录**：默认 `<omnirt>/models`，对应环境变量 **`OMNIRT_MUSETALK_MODELS_DIR`**。
-- **布局**须满足 MuseTalk v1.5 加载需要（`musetalk/`、`sd-vae-ft-mse/`、`whisper/tiny.pt` 等），详见 [`model_backends/musetalk/README.md`](https://github.com/datascale-ai/omnirt/blob/main/model_backends/musetalk/README.md)。
+- **版本**默认 `OMNIRT_MUSETALK_VERSION=v1`，使用 `musetalk/` 和 `whisper/tiny.pt`；`v15` 使用 `musetalkV15/` 及 `OMNIRT_MUSETALK_WHISPER_DIR` 指定的 HF whisper-tiny 目录（默认 `/models/whisper-hf`）。共用 VAE、DWPose、FaceParsing 权重。指定的官方源码 commit 与完整目录要求见 [`model_backends/musetalk/README.md`](https://github.com/datascale-ai/omnirt/blob/main/model_backends/musetalk/README.md)。
 - **`sd-vae-ft-mse/`** 建议使用 Hugging Face 官方 `stabilityai/sd-vae-ft-mse` 的 Diffusers 格式：`config.json` + `diffusion_pytorch_model.safetensors`。只有 `diffusion_pytorch_model.bin` 时可 fallback，但会产生 unsafe serialization warning。
 - **`whisper/tiny.pt`** 须为 **OpenAI `openai-whisper` 官方** 检查点（约 72MB），勿将 HuggingFace `pytorch_model.bin` 改名顶替。
 
@@ -91,6 +91,8 @@ wget -O models/sd-vae-ft-mse/diffusion_pytorch_model.safetensors \
 | `OMNIRT_MUSETALK_NPU_INDEX` | 逻辑 NPU 序号，默认 `0` |
 | `OMNIRT_MUSETALK_REPO` | MuseTalk 源码 checkout；默认 `${OMNIRT_HOME}/model-repos/MuseTalk` |
 | `OMNIRT_MUSETALK_MODELS_DIR` | 权重根目录 |
+| `OMNIRT_MUSETALK_VERSION` | `v1`（默认，保留现有加载行为）或 `v15` |
+| `OMNIRT_MUSETALK_WHISPER_DIR` | v15 的 HF whisper-tiny 目录，默认 `/models/whisper-hf` |
 | `OMNIRT_MUSETALK_MAX_LONG_EDGE` | `init` 参考图最长边上限（默认 `768`）；`0` 表示不缩放 |
 | `OMNIRT_MUSETALK_PRELOAD` | `1` 时在监听前预加载模型，减少首连等待 |
 | `OMNIRT_MUSETALK_DEFAULT_REF_IMAGE` | 客户端 `init` 未带 `ref_image` 时的本地图片（可选） |
@@ -138,7 +140,7 @@ pip install -r model_backends/musetalk/requirements-musetalk-gpu.txt \
 | 现象 | 常见原因 |
 |------|----------|
 | `libhccl.so` 找不到 | 未 `source` CANN `set_env.sh`，或未通过 `start_musetalk_ws.sh` 加载环境 |
-| MuseTalk v1.5 加载失败 | 权重路径不齐；`sd-vae-ft-mse/` 缺少 `config.json`；`whisper/tiny.pt` 非官方 OpenAI 格式（数百字节 XML） |
+| MuseTalk v1.5 加载失败 | 检查 `musetalkV15/musetalk.json`、`unet.pth` 和 HF Whisper 目录中的 `config.json`、`preprocessor_config.json`、`model.safetensors`（或 `pytorch_model.bin`），以及共用权重 |
 | VAE 提示 unsafe serialization | `sd-vae-ft-mse/` 只有 `diffusion_pytorch_model.bin`；补齐官方 `diffusion_pytorch_model.safetensors` |
 | `UnpicklingError` / Whisper 加载失败 | PyTorch 与 `openai-whisper` 对旧 checkpoint 的兼容问题；`musetalk_ws_server.py` 已对官方 `tiny.pt` 做加载补丁，请更新到当前仓库版本 |
 | Toolkit 目录 **owner** 与当前用户不一致的 Warning | 多为 root 安装 toolkit；一般不影响运行，必要时请管理员调整属主 |

@@ -66,7 +66,7 @@ Graph compilation may still require **`attrs`**, **`psutil`**, **`PyYAML`**, etc
 
 - **MuseTalk source:** run `omnirt runtime install musetalk --device npu`; by default it clones to `${OMNIRT_HOME}/model-repos/MuseTalk`.
 - **Root directory:** default `<omnirt>/models`, controlled by **`OMNIRT_MUSETALK_MODELS_DIR`**.
-- Layout must satisfy MuseTalk v1.5 loading (`musetalk/`, `sd-vae-ft-mse/`, `whisper/tiny.pt`, …)—see [`model_backends/musetalk/README.md`](https://github.com/datascale-ai/omnirt/blob/main/model_backends/musetalk/README.md).
+- **Version:** `OMNIRT_MUSETALK_VERSION=v1` is the default and uses `musetalk/` plus `whisper/tiny.pt`. `v15` uses `musetalkV15/` and the HF whisper-tiny directory set by `OMNIRT_MUSETALK_WHISPER_DIR` (default `/models/whisper-hf`). Both versions share VAE, DWPose, and FaceParsing weights. See [`model_backends/musetalk/README.md`](https://github.com/datascale-ai/omnirt/blob/main/model_backends/musetalk/README.md) for the pinned upstream commit and full layout.
 - **`sd-vae-ft-mse/`** should use the official Hugging Face `stabilityai/sd-vae-ft-mse` Diffusers files: `config.json` plus `diffusion_pytorch_model.safetensors`. `diffusion_pytorch_model.bin` can be used as a fallback, but Diffusers will warn about unsafe serialization.
 - **`whisper/tiny.pt`** must be the official **OpenAI `openai-whisper`** checkpoint (~72 MB). Do not rename a Hugging Face `pytorch_model.bin` and expect it to work.
 
@@ -91,6 +91,8 @@ If direct Hugging Face access is restricted, replace the domain with `https://hf
 | `OMNIRT_MUSETALK_NPU_INDEX` | Logical NPU index (default `0`) |
 | `OMNIRT_MUSETALK_REPO` | MuseTalk source checkout; default `${OMNIRT_HOME}/model-repos/MuseTalk` |
 | `OMNIRT_MUSETALK_MODELS_DIR` | Model root |
+| `OMNIRT_MUSETALK_VERSION` | `v1` (default, preserves existing loading behavior) or `v15` |
+| `OMNIRT_MUSETALK_WHISPER_DIR` | v15 HF whisper-tiny directory, default `/models/whisper-hf` |
 | `OMNIRT_MUSETALK_MAX_LONG_EDGE` | Max long edge for reference images in `init` (default `768`; `0` disables scaling) |
 | `OMNIRT_MUSETALK_PRELOAD` | When `1`, loads models before listening |
 | `OMNIRT_MUSETALK_DEFAULT_REF_IMAGE` | Local fallback image when `init` omits `ref_image` (optional) |
@@ -138,7 +140,7 @@ Set **`OMNIRT_MUSETALK_DEVICE=cuda`**, or keep **`auto`** on machines without NP
 | Symptom | Likely cause |
 |---------|----------------|
 | Missing `libhccl.so` | CANN `set_env.sh` not sourced or launcher path mismatch |
-| MuseTalk v1.5 fails to load | Incomplete weights; missing `config.json` under `sd-vae-ft-mse/`; **`whisper/tiny.pt`** not the official OpenAI file (tiny XML placeholder) |
+| MuseTalk v1.5 fails to load | Check `musetalkV15/musetalk.json`, `unet.pth`, and the HF Whisper directory's `config.json`, `preprocessor_config.json`, and `model.safetensors` (or `pytorch_model.bin`), plus shared weights |
 | VAE warns about unsafe serialization | `sd-vae-ft-mse/` only has `diffusion_pytorch_model.bin`; add the official `diffusion_pytorch_model.safetensors` |
 | `UnpicklingError` / Whisper load failure | PyTorch vs `openai-whisper` checkpoint compatibility—`musetalk_ws_server.py` patches loading for official `tiny.pt`; use current tree |
 | Toolkit directory owner warning | Often root-installed toolkit; usually harmless |

@@ -57,26 +57,42 @@ CUDA runtime 当前跟随 MuseTalk 官方 1.5 依赖组合：Python 3.10、PyTor
 
 ## 权重目录（`OMNIRT_MUSETALK_MODELS_DIR`，默认 `<omnirt>/models`）
 
-须满足 MuseTalk v1.5 加载所需的目录结构：
+`OMNIRT_MUSETALK_VERSION` 默认 `v1`，沿用现有权重和 `Audio2Feature`。设置为 `v15` 时使用独立 UNet 权重，以及 `AudioProcessor` + `transformers.WhisperModel`；不加载旧版 `Audio2Feature` 或 `whisper/tiny.pt`。
+
+v1.5 适配参考官方 commit [`0a89dec45a0192b824e3cf4daf96c239440c5ed8`](https://github.com/TMElyralab/MuseTalk/tree/0a89dec45a0192b824e3cf4daf96c239440c5ed8)，重点为 `scripts/realtime_inference.py`、`musetalk/utils/audio_processor.py`、`musetalk/utils/utils.py`。`OMNIRT_MUSETALK_REPO` 应指向此提交的源码 checkout。
 
 | 相对路径 | 说明 |
 |----------|------|
-| `musetalk/pytorch_model.bin`、`musetalk/musetalk.json` | UNet |
-| `sd-vae-ft-mse/` | VAE（官方 `config.json` + `diffusion_pytorch_model.safetensors`；`diffusion_pytorch_model.bin` 可作为 fallback） |
-| `whisper/tiny.pt` | **OpenAI `openai-whisper` 官方** tiny 检查点（约 72MB），**不要**用 HuggingFace `pytorch_model.bin` 改名顶替 |
+| `musetalk/pytorch_model.bin`、`musetalk/musetalk.json` | **v1** UNet |
+| `musetalkV15/unet.pth`、`musetalkV15/musetalk.json` | **v15** UNet |
+| `sd-vae-ft-mse/` | 两版本共用 VAE：`config.json` + `diffusion_pytorch_model.bin`（当前布局检查要求 `.bin`；可额外提供 `.safetensors`） |
+| `whisper/tiny.pt` | **v1** 使用 OpenAI `openai-whisper` 官方 tiny 检查点（约 72MB），不要用 HuggingFace `pytorch_model.bin` 改名顶替 |
 | `dwpose/dw-ll_ucoco_384.pth` | DWPose |
 | `face-parse-bisenet/79999_iter.pth` | BiSeNet；同目录常配 `resnet18-5c106cde.pth`（PyTorch 官方 ResNet18） |
+
+**v15 的 HF Whisper 目录**由 `OMNIRT_MUSETALK_WHISPER_DIR` 单独指定，默认绝对路径 `/models/whisper-hf`，不随 `OMNIRT_MUSETALK_MODELS_DIR` 改变。使用 Hugging Face `openai/whisper-tiny` 模型目录，至少包含：
+
+```text
+/models/whisper-hf/
+├── config.json
+├── preprocessor_config.json
+└── model.safetensors          # 或 pytorch_model.bin
+```
+
+v15 不要求保留 v1 的 `musetalk/` 和 `whisper/tiny.pt`。共用的 VAE、DWPose、FaceParsing 权重仍需齐备。缺少 v15 UNet、HF Whisper 配置或权重时，服务会报告版本及缺失路径。
 
 官方 `tiny.pt` 可用已安装 `openai-whisper` 的 Python 按包内 URL 下载并校验 SHA256；或从
 `https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt`
 下载，SHA256 应为文件名中的 `65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9`。
 
-`sd-vae-ft-mse/` 推荐使用 Hugging Face 官方 `stabilityai/sd-vae-ft-mse` Diffusers 格式文件：
+`sd-vae-ft-mse/` 使用 Hugging Face 官方 `stabilityai/sd-vae-ft-mse` Diffusers 格式文件（保留现有布局检查要求的 `.bin`）：
 
 ```bash
 mkdir -p models/sd-vae-ft-mse
 wget -O models/sd-vae-ft-mse/config.json \
   https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/config.json
+wget -O models/sd-vae-ft-mse/diffusion_pytorch_model.bin \
+  https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/diffusion_pytorch_model.bin
 wget -O models/sd-vae-ft-mse/diffusion_pytorch_model.safetensors \
   https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/diffusion_pytorch_model.safetensors
 ```
@@ -101,6 +117,16 @@ bash scripts/start_musetalk_ws.sh
 
 OpenTalking：`OPENTALKING_FLASHTALK_MODE=remote`，`OPENTALKING_FLASHTALK_WS_URL=ws://<host>:8766`。
 
+启用 v15 时，在启动前增加：
+
+```bash
+export OMNIRT_MUSETALK_VERSION=v15
+export OMNIRT_MUSETALK_MODELS_DIR=/models
+export OMNIRT_MUSETALK_WHISPER_DIR=/models/whisper-hf
+```
+
+启动日志明确输出 `MuseTalk version=v1` 或 `MuseTalk version=v15`。`init/init_ok`、`AUDI`、`VIDX`、默认 25fps、chunk streaming、会话预处理及 JPEG 输出均沿用现有协议。
+
 ---
 
 ## 常用环境变量
@@ -110,6 +136,12 @@ OpenTalking：`OPENTALKING_FLASHTALK_MODE=remote`，`OPENTALKING_FLASHTALK_WS_UR
 | `OMNIRT_MUSETALK_HOST` / `PORT` | 绑定地址 / 端口 |
 | `OMNIRT_MUSETALK_REPO` | MuseTalk 源码 checkout；默认 `${OMNIRT_HOME}/model-repos/MuseTalk` |
 | `OMNIRT_MUSETALK_MODELS_DIR` | 权重根目录 |
+| `OMNIRT_MUSETALK_VERSION` | `v1`（默认）或 `v15` |
+| `OMNIRT_MUSETALK_WHISPER_DIR` | v15 的 HF whisper-tiny 目录，默认 `/models/whisper-hf` |
+| `OMNIRT_MUSETALK_BBOX_SHIFT` | v1 使用该值（默认 `0`）；v15 固定 `0` |
+| `OMNIRT_MUSETALK_EXTRA_MARGIN` | v15 裁脸下边界增加的像素数，默认 `10`，不超过图像高度 |
+| `OMNIRT_MUSETALK_PARSING_MODE` | v15 的官方融合解析模式，默认 `jaw`（也支持 `neck`、`raw`） |
+| `OMNIRT_MUSETALK_LEFT_CHEEK_WIDTH` / `OMNIRT_MUSETALK_RIGHT_CHEEK_WIDTH` | v15 的 FaceParsing 参数，默认各 `90` |
 | `OMNIRT_MUSETALK_DEVICE` | `auto` / `npu` / `cuda` / `cpu` |
 | `OMNIRT_MUSETALK_MAX_LONG_EDGE` | `init` 里 ref 图最长边上限（默认 768；`0` 表示不缩放） |
 | `OMNIRT_MUSETALK_JPEG_QUALITY` | 输出 VIDX JPEG 质量 |
@@ -120,5 +152,6 @@ OpenTalking：`OPENTALKING_FLASHTALK_MODE=remote`，`OPENTALKING_FLASHTALK_WS_UR
 
 - **Ascend 目录 owner 警告**：toolkit 若 root 安装、普通用户运行，可能警告属主不一致，一般不影响推理。
 - **Whisper `tiny.pt` 只有几百字节且为 XML**：下载错误或误用 HF 权重，按上文替换官方 `tiny.pt`。
+- **v15 缺少 `mmcv` / `mmpose` 等预处理依赖**：补齐官方 landmark 预处理依赖；v15 会明确报错，v1 保留现有 SFD fallback。
 - **嘴型与底图错位**：OpenTalking `composer` 须对 MuseTalk 使用 **infer 框**贴回（若你自行改过分支，请保持与 upstream 一致）。
 - **参考图「只有一块脸在动」**：MuseTalk 本身只在人脸区域生成再贴回；远景小脸会更像贴片，可换近景正脸或调整 `OMNIRT_MUSETALK_MAX_LONG_EDGE`。
