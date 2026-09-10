@@ -25,6 +25,7 @@ Environment (high level):
   OMNIRT_MUSETALK_DEFAULT_REF_IMAGE optional default ref_image if init omits it
   OMNIRT_MUSETALK_FRAME_NUM / MOTION_FRAMES_NUM / FPS  protocol chunking (defaults match wav2lip)
   OMNIRT_MUSETALK_JPEG_QUALITY      1-100 (default 85)
+  OMNIRT_MUSETALK_TAIL_SILENCE_MS   flush silence duration, 0-1000 ms (default 320)
   OMNIRT_MUSETALK_MAX_LONG_EDGE / MIN_LONG_EDGE  ref_image resize (same semantics as wav2lip)
 
 Dependencies: ``requirements-musetalk-ascend.txt`` (NPU) or ``requirements-musetalk-gpu.txt`` (CUDA).
@@ -345,6 +346,25 @@ def _encode_video_message(jpeg_parts: list[bytes]) -> bytes:
     return bytes(buf)
 
 
+def _encode_video_frames(frames: list[np.ndarray], jpeg_quality: int) -> bytes:
+    jpeg_parts: list[bytes] = []
+    for frame in frames:
+        ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+        if not ok:
+            raise RuntimeError("JPEG encode failed")
+        jpeg_parts.append(enc.tobytes())
+    return _encode_video_message(jpeg_parts)
+
+
+def _tail_silence_ms() -> int:
+    raw = os.environ.get("OMNIRT_MUSETALK_TAIL_SILENCE_MS", "320")
+    try:
+        return min(1000, max(0, int(raw)))
+    except ValueError:
+        LOG.warning("Invalid OMNIRT_MUSETALK_TAIL_SILENCE_MS=%r, using 320", raw)
+        return 320
+
+
 def _try_import_torch_npu() -> bool:
     try:
         import torch_npu  # noqa: F401
@@ -609,6 +629,7 @@ class MuseTalkRuntime:
         *,
         slice_len: int,
         fps: int,
+        strict_frame_count: bool = False,
     ) -> list[np.ndarray]:
         if state.audio_context is not None and state.audio_context.size:
             audio_for_features = np.concatenate([state.audio_context, pcm_int16])
@@ -647,6 +668,8 @@ class MuseTalkRuntime:
         chunks = chunks[start_frame : start_frame + slice_len]
         if not chunks:
             raise RuntimeError("MuseTalk audio feature extraction produced zero chunks")
+        if strict_frame_count and len(chunks) < slice_len:
+            raise RuntimeError(f"MuseTalk flush requires {slice_len} audio features, got {len(chunks)}")
         while len(chunks) < slice_len:
             chunks.append(chunks[-1])
         if self.version == "v1":
@@ -690,6 +713,8 @@ class MuseTalkRuntime:
                             return frames
         if not frames:
             raise RuntimeError("MuseTalk produced zero frames for this chunk")
+        if strict_frame_count and len(frames) < slice_len:
+            raise RuntimeError(f"MuseTalk flush requires {slice_len} inferred frames, got {len(frames)}")
         while len(frames) < slice_len:
             frames.append(frames[-1].copy())
         return frames[:slice_len]
@@ -782,6 +807,7 @@ async def _handler(websocket) -> None:
                                 "fps": fps,
                                 "height": int(height),
                                 "width": int(width),
+                                **({"capabilities": ["flush"]} if runtime.version == "v15" else {}),
                             }
                         )
                     )
@@ -792,6 +818,38 @@ async def _handler(websocket) -> None:
                         slice_len,
                         expected_pcm,
                         _inference_device_str(),
+                    )
+
+                elif msg_type == "flush":
+                    if not session_active or state is None:
+                        await websocket.send(json.dumps({
+                            "type": "error", "message": "No active session. Send init first.",
+                        }))
+                        continue
+                    tail_ms = _tail_silence_ms()
+                    pcm = np.zeros(int(SAMPLE_RATE * tail_ms / 1000), dtype=np.int16)
+                    # Only request complete frames supported by the PCM duration.
+                    tail_frames = len(pcm) * fps // SAMPLE_RATE
+                    started = time.perf_counter()
+                    try:
+                        if tail_frames:
+                            runtime = _get_runtime()
+                            frames_bgr = await asyncio.get_running_loop().run_in_executor(
+                                None,
+                                functools.partial(
+                                    runtime.render_chunk, state, pcm,
+                                    slice_len=tail_frames, fps=fps, strict_frame_count=True,
+                                ),
+                            )
+                            await websocket.send(_encode_video_frames(frames_bgr, jpeg_q))
+                    except Exception as exc:
+                        LOG.exception("MuseTalk flush failed: %s", exc)
+                        await websocket.send(json.dumps({"type": "error", "message": f"flush failed: {exc}"}))
+                        continue
+                    await websocket.send(json.dumps({"type": "flush_ok"}))
+                    LOG.info(
+                        "MuseTalk flush: tail=%dms frames=%d total=%.1fms",
+                        tail_ms, tail_frames, (time.perf_counter() - started) * 1000.0,
                     )
 
                 elif msg_type == "close":
@@ -861,18 +919,7 @@ async def _handler(websocket) -> None:
                     )
                     continue
 
-                jpeg_parts: list[bytes] = []
-                for fb in frames_bgr:
-                    ok, enc = cv2.imencode(
-                        ".jpg",
-                        fb,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q],
-                    )
-                    if not ok:
-                        raise RuntimeError("JPEG encode failed")
-                    jpeg_parts.append(enc.tobytes())
-
-                vmsg = _encode_video_message(jpeg_parts)
+                vmsg = _encode_video_frames(frames_bgr, jpeg_q)
                 await websocket.send(vmsg)
                 t_done = time.perf_counter()
                 LOG.info(

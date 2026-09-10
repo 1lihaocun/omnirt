@@ -127,6 +127,18 @@ export OMNIRT_MUSETALK_WHISPER_DIR=/models/whisper-hf
 
 启动日志明确输出 `MuseTalk version=v1` 或 `MuseTalk version=v15`。`init/init_ok`、`AUDI`、`VIDX`、默认 25fps、chunk streaming、会话预处理及 JPEG 输出均沿用现有协议。
 
+### 实时整轮回复结束：flush 扩展
+
+v15 的 `init_ok` 增加 `"capabilities": ["flush"]`。客户端在**整轮 TTS 音频的所有 AUDI 块处理完毕后**发送 `{"type":"flush"}`，不能在每个音频块或每个 TTS 分句后发送，也不能用 `close` 代替。
+
+服务保留同一个 `MuseTalkSessionState`，将一小段零 PCM 接在已有 `audio_context` 后继续推理，返回现有格式的短 `VIDX`，最后返回 `{"type":"flush_ok"}`。客户端消费完尾帧和 ACK 后可继续在同一会话发送 `AUDI`。`close/close_ok` 仍用于释放会话。
+
+`OMNIRT_MUSETALK_TAIL_SILENCE_MS` 默认 `320`，范围 `0–1000` ms（超限钳制，非整数回退 `320`）。25fps 下 320ms 是 5120 个 int16 零样本和 8 帧；按完整帧向下取整，0ms 或不足一帧时仅返回 `flush_ok`。正常 AUDI 仍为 25 帧；flush 不补齐到 25 帧，特征或推理帧不足会报错，不复制最后一帧代替静音推理。
+
+v1 不声明该能力，更新后的 OpenTalking 默认保留 v1 和旧服务的原有静音处理；显式发给新 server 的 flush 可以复用 v1 推理路径。只更新 server、仍使用旧 client 时，不会自动触发 flush。OmniRT 的 MuseTalk WS 代理透明转发该扩展。
+
+性能日志示例：`MuseTalk flush: tail=320ms frames=8 total=123.4ms`。真实 GPU 上仍需检查尾帧嘴型及耗时；协议测试不证明视觉闭嘴效果。
+
 ---
 
 ## 常用环境变量
@@ -145,6 +157,7 @@ export OMNIRT_MUSETALK_WHISPER_DIR=/models/whisper-hf
 | `OMNIRT_MUSETALK_DEVICE` | `auto` / `npu` / `cuda` / `cpu` |
 | `OMNIRT_MUSETALK_MAX_LONG_EDGE` | `init` 里 ref 图最长边上限（默认 768；`0` 表示不缩放） |
 | `OMNIRT_MUSETALK_JPEG_QUALITY` | 输出 VIDX JPEG 质量 |
+| `OMNIRT_MUSETALK_TAIL_SILENCE_MS` | flush 静音时长，默认 `320` ms，范围 `0–1000` |
 
 ---
 

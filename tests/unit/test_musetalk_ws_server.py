@@ -352,6 +352,30 @@ def test_render_preserves_context_chunk_length_and_tensor_features(runtime_facto
     np.testing.assert_array_equal(writes[1][0], np.concatenate([pcm, -pcm]).astype(np.float32) / 32768)
     if version == "v15":
         assert api_calls == [{"fps": 25, "audio_padding_length_left": 2, "audio_padding_length_right": 2}] * 2
+    if shortfall == 0:
+        tail = runtime.render_chunk(
+            state, np.zeros(5120, dtype=np.int16), slice_len=8, fps=25,
+            strict_frame_count=True,
+        )
+        assert len(tail) == 8
+        assert state.frame_cursor == 58
+        np.testing.assert_array_equal(writes[-1][0][:16000], -pcm.astype(np.float32) / 32768)
+        assert not writes[-1][0][16000:].any()
+        # These are newly inferred frames, not copies of the last speech frame (49).
+        assert [int(frame[0, 0, 0]) for frame in tail] == list(range(25, 33))
+        decode = runtime.vae.decode_latents
+        runtime.vae.decode_latents = lambda latents: decode(latents)[:-1]
+        with pytest.raises(RuntimeError, match="flush requires 8 inferred frames, got 6"):
+            runtime.render_chunk(
+                state, np.zeros(5120, dtype=np.int16), slice_len=8, fps=25,
+                strict_frame_count=True,
+            )
+    else:
+        with pytest.raises(RuntimeError, match="flush requires 8 audio features, got 6"):
+            runtime.render_chunk(
+                state, np.zeros(5120, dtype=np.int16), slice_len=8, fps=25,
+                strict_frame_count=True,
+            )
 
 
 @pytest.mark.parametrize("version", ["v1", "v15"])
@@ -388,7 +412,9 @@ def test_preload_and_ws_protocol_stay_compatible(runtime_factory, monkeypatch, v
     assert runtime.render_chunk.call_count == 2
     assert runtime.render_chunk.call_args.args[0] is state
     assert runtime.render_chunk.call_args.kwargs == {"slice_len": 25, "fps": 25}
-    assert json.loads(ws.sent[0]) == {"type": "init_ok", "frame_num": 33, "motion_frames_num": 8,
+    init = json.loads(ws.sent[0])
+    assert init.pop("capabilities", []) == (["flush"] if version == "v15" else [])
+    assert init == {"type": "init_ok", "frame_num": 33, "motion_frames_num": 8,
                                       "slice_len": 25, "fps": 25, "height": 16, "width": 24}
     assert json.loads(ws.sent[3]) == {"type": "close_ok"}
     for message in ws.sent[1:3]:
@@ -415,3 +441,63 @@ def test_startup_logs_version_without_preload(monkeypatch, caplog, version):
     with caplog.at_level(logging.INFO):
         assert server.main([]) == 0
     assert f"MuseTalk version={version}" in caplog.text
+
+
+@pytest.mark.parametrize("version", ["v1", "v15"])
+@pytest.mark.parametrize(("tail_ms", "frames"), [(None, 8), (0, 0), (1000, 25)])
+def test_flush_infers_silence_preserves_session_and_close(
+    runtime_factory, monkeypatch, caplog, version, tail_ms, frames,
+):
+    runtime, _ = runtime_factory(version)
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    if tail_ms is not None:
+        monkeypatch.setenv("OMNIRT_MUSETALK_TAIL_SILENCE_MS", str(tail_ms))
+    frame = np.full((16, 24, 3), 128, dtype=np.uint8)
+    state = SimpleNamespace(audio_context=np.ones(16000, dtype=np.int16))
+    prepare = Mock(return_value=state)
+    render = Mock(side_effect=lambda passed_state, pcm, **kw: [frame.copy() for _ in range(kw["slice_len"])])
+    monkeypatch.setattr(runtime, "prepare_session", prepare)
+    monkeypatch.setattr(runtime, "render_chunk", render)
+    ok, png = cv2.imencode(".png", frame)
+    assert ok
+    messages = [json.dumps({"type": "init", "ref_image": base64.b64encode(png).decode()}),
+                b"AUDI" + bytes(32000), json.dumps({"type": "flush"}),
+                b"AUDI" + bytes(32000), json.dumps({"type": "close"}),
+                b"AUDI" + bytes(32000), json.dumps({"type": "flush"})]
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def __aiter__(self):
+            for message in messages:
+                yield message
+
+        async def send(self, message):
+            self.sent.append(message)
+
+    ws = WebSocket()
+    with caplog.at_level(logging.INFO):
+        asyncio.run(server._handler(ws))
+    init = json.loads(ws.sent[0])
+    assert ("flush" in init.get("capabilities", [])) == (version == "v15")
+    expected = ["init_ok", 25] + ([frames] if frames else []) + ["flush_ok", 25, "close_ok", "error", "error"]
+    assert [struct.unpack_from("<I", m, 4)[0] if isinstance(m, bytes) else json.loads(m)["type"] for m in ws.sent] == expected
+    prepare.assert_called_once()
+    assert all(call.args[0] is state for call in render.call_args_list)
+    assert render.call_count == (3 if frames else 2)
+    if frames:
+        tail_call = render.call_args_list[1]
+        assert tail_call.args[1].dtype == np.int16
+        assert tail_call.args[1].size == int(16000 * (320 if tail_ms is None else tail_ms) / 1000)
+        assert not tail_call.args[1].any()
+        assert tail_call.kwargs == {"slice_len": frames, "fps": 25, "strict_frame_count": True}
+        assert ws.sent[2][:4] == b"VIDX"
+    assert "MuseTalk flush: tail=" in caplog.text
+    assert f"frames={frames}" in caplog.text
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("-1", 0), ("1001", 1000), ("invalid", 320), ("39", 39)])
+def test_tail_silence_setting_is_bounded(monkeypatch, raw, expected):
+    monkeypatch.setenv("OMNIRT_MUSETALK_TAIL_SILENCE_MS", raw)
+    assert server._tail_silence_ms() == expected
