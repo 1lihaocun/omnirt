@@ -17,6 +17,7 @@ Environment (high level):
   OMNIRT_MUSETALK_WHISPER_DIR       v15 HF whisper-tiny directory (default /models/whisper-hf)
   OMNIRT_MUSETALK_EXTRA_MARGIN      v15 lower face crop margin (default 10); bbox_shift is always 0
   OMNIRT_MUSETALK_PARSING_MODE      v15 face parsing mode (default jaw)
+  OMNIRT_MUSETALK_SILENCE_GATE      v15 normalized frame-energy threshold (default 0.04; 0 disables)
   OMNIRT_MUSETALK_LEFT_CHEEK_WIDTH / RIGHT_CHEEK_WIDTH  v15 parsing widths (default 90 each)
   OMNIRT_MUSETALK_DEVICE            auto | npu | npu:0 | cuda | cpu (default auto)
   OMNIRT_MUSETALK_NPU_INDEX         used when DEVICE=npu (default 0)
@@ -25,7 +26,6 @@ Environment (high level):
   OMNIRT_MUSETALK_DEFAULT_REF_IMAGE optional default ref_image if init omits it
   OMNIRT_MUSETALK_FRAME_NUM / MOTION_FRAMES_NUM / FPS  protocol chunking (defaults match wav2lip)
   OMNIRT_MUSETALK_JPEG_QUALITY      1-100 (default 85)
-  OMNIRT_MUSETALK_TAIL_SILENCE_MS   flush silence duration, 0-1000 ms (default 320)
   OMNIRT_MUSETALK_MAX_LONG_EDGE / MIN_LONG_EDGE  ref_image resize (same semantics as wav2lip)
 
 Dependencies: ``requirements-musetalk-ascend.txt`` (NPU) or ``requirements-musetalk-gpu.txt`` (CUDA).
@@ -44,7 +44,7 @@ import tempfile
 import struct
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
@@ -346,25 +346,6 @@ def _encode_video_message(jpeg_parts: list[bytes]) -> bytes:
     return bytes(buf)
 
 
-def _encode_video_frames(frames: list[np.ndarray], jpeg_quality: int) -> bytes:
-    jpeg_parts: list[bytes] = []
-    for frame in frames:
-        ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-        if not ok:
-            raise RuntimeError("JPEG encode failed")
-        jpeg_parts.append(enc.tobytes())
-    return _encode_video_message(jpeg_parts)
-
-
-def _tail_silence_ms() -> int:
-    raw = os.environ.get("OMNIRT_MUSETALK_TAIL_SILENCE_MS", "320")
-    try:
-        return min(1000, max(0, int(raw)))
-    except ValueError:
-        LOG.warning("Invalid OMNIRT_MUSETALK_TAIL_SILENCE_MS=%r, using 320", raw)
-        return 320
-
-
 def _try_import_torch_npu() -> bool:
     try:
         import torch_npu  # noqa: F401
@@ -403,6 +384,55 @@ class MuseTalkSessionState:
     mask_coords_cycle: list[tuple[int, int, int, int]]
     frame_cursor: int = 0
     audio_context: np.ndarray | None = None
+    closed_prediction_cache: dict[int, np.ndarray] = field(default_factory=dict)
+
+
+def _compute_per_frame_energy(pcm_f32: np.ndarray, frame_count: int) -> np.ndarray:
+    """Match OpenTalking's local MuseTalk energy gate, using only the current PCM."""
+    if frame_count <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    x = np.asarray(pcm_f32, dtype=np.float32).reshape(-1)
+    energies = np.zeros((frame_count,), dtype=np.float32)
+    if x.size == 0:
+        return energies
+    boundaries = np.linspace(0, x.shape[0], num=frame_count + 1, dtype=np.int32)
+    for i in range(frame_count):
+        start, end = int(boundaries[i]), int(boundaries[i + 1])
+        if end <= start:
+            end = min(x.shape[0], start + 1)
+        window = x[start:end]
+        if window.size == 0:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(window), dtype=np.float32)))
+        zcr = float(np.mean(np.abs(np.diff(np.signbit(window))))) if window.size > 1 else 0.0
+        energies[i] = rms * (1.0 + 0.25 * zcr)
+    peak = float(np.max(energies))
+    if peak > 1e-6:
+        floor = max(0.01, min(0.06, peak * 0.18))
+        energies = np.clip((energies - floor) / max(1e-6, peak - floor), 0.0, 1.0)
+        energies = energies * energies * (3.0 - 2.0 * energies)
+    else:
+        energies.fill(0.0)
+    return energies.astype(np.float32, copy=False)
+
+
+def _blend_prediction_toward_closed_mouth(
+    prediction: np.ndarray, closed_prediction: np.ndarray, amount: float,
+) -> np.ndarray:
+    """Use the local adapter's feathered mouth ellipse before official face blending."""
+    if amount <= 1e-4:
+        return prediction
+    size = prediction.shape[0]
+    yy, xx = np.ogrid[:size, :size]
+    ellipse = (
+        ((xx - size // 2) / max(1, int(size * 0.20))) ** 2
+        + ((yy - int(size * 0.69)) / max(1, int(size * 0.12))) ** 2
+    ) <= 1.0
+    mask = ellipse.astype(np.float32)
+    mask = cv2.GaussianBlur(mask, (0, 0), size * 0.045)
+    mask = (mask * float(np.clip(amount, 0.0, 1.0)))[:, :, np.newaxis]
+    blended = prediction.astype(np.float32) * (1.0 - mask) + closed_prediction.astype(np.float32) * mask
+    return np.clip(blended, 0.0, 255.0).astype(np.uint8)
 
 
 def _patch_openai_whisper_torch_load() -> None:
@@ -468,6 +498,11 @@ class MuseTalkRuntime:
         if self.version == "v15":
             self.extra_margin = int(os.environ.get("OMNIRT_MUSETALK_EXTRA_MARGIN", "10"))
             self.parsing_mode = os.environ.get("OMNIRT_MUSETALK_PARSING_MODE", "jaw")
+        self.silence_gate = 0.0
+        if self.version == "v15":
+            self.silence_gate = float(os.environ.get("OMNIRT_MUSETALK_SILENCE_GATE", "0.04"))
+            if not 0.0 <= self.silence_gate <= 1.0:
+                raise ValueError("OMNIRT_MUSETALK_SILENCE_GATE must be between 0 and 1")
         self.audio_context_samples = max(
             0,
             int(os.environ.get("OMNIRT_MUSETALK_AUDIO_CONTEXT_SAMPLES", str(SAMPLE_RATE))),
@@ -622,6 +657,24 @@ class MuseTalkRuntime:
             )
             return mask_array, tuple(int(v) for v in crop_box)
 
+    def _closed_mouth_prediction(
+        self, state: MuseTalkSessionState, feature: torch.Tensor, latent_index: int,
+    ) -> np.ndarray:
+        """Cache a zero-feature prediction per avatar latent, as in the local adapter.
+
+        Zero PCM still produces Whisper embeddings. The closure reference instead
+        uses zero features BEFORE positional encoding, with the same face latent.
+        """
+        if latent_index not in state.closed_prediction_cache:
+            dtype = self.unet.model.dtype
+            silent_features = self.pe(torch.zeros_like(feature).unsqueeze(0).to(device=self.device, dtype=dtype))
+            latent = state.latent_cycle[latent_index].to(device=self.device, dtype=dtype)
+            prediction = self.unet.model(
+                latent, torch.tensor([0], device=self.device), encoder_hidden_states=silent_features,
+            ).sample
+            state.closed_prediction_cache[latent_index] = self.vae.decode_latents(prediction)[0].copy()
+        return state.closed_prediction_cache[latent_index]
+
     def render_chunk(
         self,
         state: MuseTalkSessionState,
@@ -629,8 +682,11 @@ class MuseTalkRuntime:
         *,
         slice_len: int,
         fps: int,
-        strict_frame_count: bool = False,
     ) -> list[np.ndarray]:
+        gate_energy = (
+            _compute_per_frame_energy(pcm_int16.astype(np.float32) / 32768.0, slice_len)
+            if self.version == "v15" and self.silence_gate > 0.0 else None
+        )
         if state.audio_context is not None and state.audio_context.size:
             audio_for_features = np.concatenate([state.audio_context, pcm_int16])
             context_samples = int(state.audio_context.shape[0])
@@ -668,14 +724,13 @@ class MuseTalkRuntime:
         chunks = chunks[start_frame : start_frame + slice_len]
         if not chunks:
             raise RuntimeError("MuseTalk audio feature extraction produced zero chunks")
-        if strict_frame_count and len(chunks) < slice_len:
-            raise RuntimeError(f"MuseTalk flush requires {slice_len} audio features, got {len(chunks)}")
         while len(chunks) < slice_len:
             chunks.append(chunks[-1])
         if self.version == "v1":
             chunks = [torch.from_numpy(np.asarray(chunk)).float() for chunk in chunks]
 
         frames: list[np.ndarray] = []
+        inference_index = 0
         timesteps = torch.tensor([0], device=self.device)
         with _temporary_cwd(self.repo):
             from musetalk.utils.blending import get_image_blending
@@ -694,6 +749,15 @@ class MuseTalkRuntime:
                     ).sample
                     recon = self.vae.decode_latents(pred_latents)
                     for res_frame in recon:
+                        feature_index = inference_index
+                        inference_index += 1
+                        if gate_energy is not None and gate_energy[feature_index] <= self.silence_gate:
+                            # datagen starts its latent cycle at zero for each chunk.
+                            closed = self._closed_mouth_prediction(
+                                state, chunks[feature_index], feature_index % len(state.latent_cycle),
+                            )
+                            amount = 1.0 - float(gate_energy[feature_index]) / self.silence_gate
+                            res_frame = _blend_prediction_toward_closed_mouth(res_frame, closed, amount)
                         idx = state.frame_cursor % len(state.frame_cycle)
                         x1, y1, x2, y2 = state.face_box
                         try:
@@ -713,8 +777,6 @@ class MuseTalkRuntime:
                             return frames
         if not frames:
             raise RuntimeError("MuseTalk produced zero frames for this chunk")
-        if strict_frame_count and len(frames) < slice_len:
-            raise RuntimeError(f"MuseTalk flush requires {slice_len} inferred frames, got {len(frames)}")
         while len(frames) < slice_len:
             frames.append(frames[-1].copy())
         return frames[:slice_len]
@@ -807,7 +869,6 @@ async def _handler(websocket) -> None:
                                 "fps": fps,
                                 "height": int(height),
                                 "width": int(width),
-                                **({"capabilities": ["flush"]} if runtime.version == "v15" else {}),
                             }
                         )
                     )
@@ -818,38 +879,6 @@ async def _handler(websocket) -> None:
                         slice_len,
                         expected_pcm,
                         _inference_device_str(),
-                    )
-
-                elif msg_type == "flush":
-                    if not session_active or state is None:
-                        await websocket.send(json.dumps({
-                            "type": "error", "message": "No active session. Send init first.",
-                        }))
-                        continue
-                    tail_ms = _tail_silence_ms()
-                    pcm = np.zeros(int(SAMPLE_RATE * tail_ms / 1000), dtype=np.int16)
-                    # Only request complete frames supported by the PCM duration.
-                    tail_frames = len(pcm) * fps // SAMPLE_RATE
-                    started = time.perf_counter()
-                    try:
-                        if tail_frames:
-                            runtime = _get_runtime()
-                            frames_bgr = await asyncio.get_running_loop().run_in_executor(
-                                None,
-                                functools.partial(
-                                    runtime.render_chunk, state, pcm,
-                                    slice_len=tail_frames, fps=fps, strict_frame_count=True,
-                                ),
-                            )
-                            await websocket.send(_encode_video_frames(frames_bgr, jpeg_q))
-                    except Exception as exc:
-                        LOG.exception("MuseTalk flush failed: %s", exc)
-                        await websocket.send(json.dumps({"type": "error", "message": f"flush failed: {exc}"}))
-                        continue
-                    await websocket.send(json.dumps({"type": "flush_ok"}))
-                    LOG.info(
-                        "MuseTalk flush: tail=%dms frames=%d total=%.1fms",
-                        tail_ms, tail_frames, (time.perf_counter() - started) * 1000.0,
                     )
 
                 elif msg_type == "close":
@@ -919,7 +948,18 @@ async def _handler(websocket) -> None:
                     )
                     continue
 
-                vmsg = _encode_video_frames(frames_bgr, jpeg_q)
+                jpeg_parts: list[bytes] = []
+                for fb in frames_bgr:
+                    ok, enc = cv2.imencode(
+                        ".jpg",
+                        fb,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q],
+                    )
+                    if not ok:
+                        raise RuntimeError("JPEG encode failed")
+                    jpeg_parts.append(enc.tobytes())
+
+                vmsg = _encode_video_message(jpeg_parts)
                 await websocket.send(vmsg)
                 t_done = time.perf_counter()
                 LOG.info(

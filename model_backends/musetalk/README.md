@@ -127,17 +127,13 @@ export OMNIRT_MUSETALK_WHISPER_DIR=/models/whisper-hf
 
 启动日志明确输出 `MuseTalk version=v1` 或 `MuseTalk version=v15`。`init/init_ok`、`AUDI`、`VIDX`、默认 25fps、chunk streaming、会话预处理及 JPEG 输出均沿用现有协议。
 
-### 实时整轮回复结束：flush 扩展
+### v1.5 静音闭嘴
 
-v15 的 `init_ok` 增加 `"capabilities": ["flush"]`。客户端在**整轮 TTS 音频的所有 AUDI 块处理完毕后**发送 `{"type":"flush"}`，不能在每个音频块或每个 TTS 分句后发送，也不能用 `close` 代替。
+runtime 沿用 OpenTalking 旧本地适配器的静音门控：按当前 PCM 计算逐帧能量，低于门限时将嘴部羽化融合到闭嘴参考预测。参考使用同一人脸 latent 和位置编码前的全零音频特征生成，按 session 缓存；语音 Whisper 特征和上下文仍正常提取。只有静音帧进入闭嘴融合，语音恢复后继续使用普通预测。无需新增权重。
 
-服务保留同一个 `MuseTalkSessionState`，将一小段零 PCM 接在已有 `audio_context` 后继续推理，返回现有格式的短 `VIDX`，最后返回 `{"type":"flush_ok"}`。客户端消费完尾帧和 ACK 后可继续在同一会话发送 `AUDI`。`close/close_ok` 仍用于释放会话。
+`OMNIRT_MUSETALK_SILENCE_GATE` 默认 `0.04`，范围 `0–1`，`0` 禁用；仅影响 v15。OpenTalking 在整轮 TTS response 结束时沿用默认 320ms 尾部静音并补齐普通 AUDI 块，25fps 下最终静音帧可用于 idle。
 
-`OMNIRT_MUSETALK_TAIL_SILENCE_MS` 默认 `320`，范围 `0–1000` ms（超限钳制，非整数回退 `320`）。25fps 下 320ms 是 5120 个 int16 零样本和 8 帧；按完整帧向下取整，0ms 或不足一帧时仅返回 `flush_ok`。正常 AUDI 仍为 25 帧；flush 不补齐到 25 帧，特征或推理帧不足会报错，不复制最后一帧代替静音推理。
-
-v1 不声明该能力，更新后的 OpenTalking 默认保留 v1 和旧服务的原有静音处理；显式发给新 server 的 flush 可以复用 v1 推理路径。只更新 server、仍使用旧 client 时，不会自动触发 flush。OmniRT 的 MuseTalk WS 代理透明转发该扩展。
-
-性能日志示例：`MuseTalk flush: tail=320ms frames=8 total=123.4ms`。真实 GPU 上仍需检查尾帧嘴型及耗时；协议测试不证明视觉闭嘴效果。
+先前的 `flush/flush_ok`、能力声明及 `OMNIRT_MUSETALK_TAIL_SILENCE_MS` 已移除。曾使用该扩展的部署需要同时更新 OpenTalking client 和 MuseTalk server，恢复 `init → AUDI/VIDX → … → close`。不要使用 close 结束单轮回复。门控与融合的本地测试不代替真实 GPU 嘴型验收。
 
 ---
 
@@ -153,11 +149,11 @@ v1 不声明该能力，更新后的 OpenTalking 默认保留 v1 和旧服务的
 | `OMNIRT_MUSETALK_BBOX_SHIFT` | v1 使用该值（默认 `0`）；v15 固定 `0` |
 | `OMNIRT_MUSETALK_EXTRA_MARGIN` | v15 裁脸下边界增加的像素数，默认 `10`，不超过图像高度 |
 | `OMNIRT_MUSETALK_PARSING_MODE` | v15 的官方融合解析模式，默认 `jaw`（也支持 `neck`、`raw`） |
+| `OMNIRT_MUSETALK_SILENCE_GATE` | v15 逐帧静音门限，默认 `0.04`；`0` 禁用，v1 不读取 |
 | `OMNIRT_MUSETALK_LEFT_CHEEK_WIDTH` / `OMNIRT_MUSETALK_RIGHT_CHEEK_WIDTH` | v15 的 FaceParsing 参数，默认各 `90` |
 | `OMNIRT_MUSETALK_DEVICE` | `auto` / `npu` / `cuda` / `cpu` |
 | `OMNIRT_MUSETALK_MAX_LONG_EDGE` | `init` 里 ref 图最长边上限（默认 768；`0` 表示不缩放） |
 | `OMNIRT_MUSETALK_JPEG_QUALITY` | 输出 VIDX JPEG 质量 |
-| `OMNIRT_MUSETALK_TAIL_SILENCE_MS` | flush 静音时长，默认 `320` ms，范围 `0–1000` |
 
 ---
 

@@ -352,30 +352,6 @@ def test_render_preserves_context_chunk_length_and_tensor_features(runtime_facto
     np.testing.assert_array_equal(writes[1][0], np.concatenate([pcm, -pcm]).astype(np.float32) / 32768)
     if version == "v15":
         assert api_calls == [{"fps": 25, "audio_padding_length_left": 2, "audio_padding_length_right": 2}] * 2
-    if shortfall == 0:
-        tail = runtime.render_chunk(
-            state, np.zeros(5120, dtype=np.int16), slice_len=8, fps=25,
-            strict_frame_count=True,
-        )
-        assert len(tail) == 8
-        assert state.frame_cursor == 58
-        np.testing.assert_array_equal(writes[-1][0][:16000], -pcm.astype(np.float32) / 32768)
-        assert not writes[-1][0][16000:].any()
-        # These are newly inferred frames, not copies of the last speech frame (49).
-        assert [int(frame[0, 0, 0]) for frame in tail] == list(range(25, 33))
-        decode = runtime.vae.decode_latents
-        runtime.vae.decode_latents = lambda latents: decode(latents)[:-1]
-        with pytest.raises(RuntimeError, match="flush requires 8 inferred frames, got 6"):
-            runtime.render_chunk(
-                state, np.zeros(5120, dtype=np.int16), slice_len=8, fps=25,
-                strict_frame_count=True,
-            )
-    else:
-        with pytest.raises(RuntimeError, match="flush requires 8 audio features, got 6"):
-            runtime.render_chunk(
-                state, np.zeros(5120, dtype=np.int16), slice_len=8, fps=25,
-                strict_frame_count=True,
-            )
 
 
 @pytest.mark.parametrize("version", ["v1", "v15"])
@@ -412,9 +388,7 @@ def test_preload_and_ws_protocol_stay_compatible(runtime_factory, monkeypatch, v
     assert runtime.render_chunk.call_count == 2
     assert runtime.render_chunk.call_args.args[0] is state
     assert runtime.render_chunk.call_args.kwargs == {"slice_len": 25, "fps": 25}
-    init = json.loads(ws.sent[0])
-    assert init.pop("capabilities", []) == (["flush"] if version == "v15" else [])
-    assert init == {"type": "init_ok", "frame_num": 33, "motion_frames_num": 8,
+    assert json.loads(ws.sent[0]) == {"type": "init_ok", "frame_num": 33, "motion_frames_num": 8,
                                       "slice_len": 25, "fps": 25, "height": 16, "width": 24}
     assert json.loads(ws.sent[3]) == {"type": "close_ok"}
     for message in ws.sent[1:3]:
@@ -443,27 +417,120 @@ def test_startup_logs_version_without_preload(monkeypatch, caplog, version):
     assert f"MuseTalk version={version}" in caplog.text
 
 
+@pytest.fixture
+def silence_runtime(runtime_factory, monkeypatch):
+    def create(version="v15"):
+        runtime, _ = runtime_factory(version)
+        writes = []
+        _module(monkeypatch, "soundfile", write=lambda path, audio, rate: writes.append(audio.copy()))
+        # Deliberately nonzero even for zero PCM: model-generated silence may still
+        # have an open mouth. The real energy gate must correct that output.
+        runtime.audio_processor = SimpleNamespace(
+            get_audio_feature=lambda *args, **kwargs: (None, len(writes[-1])),
+            get_whisper_chunk=lambda features, device, dtype, whisper, length, **kwargs:
+                torch.full((length * 25 // 16000, 50, 384), 100.0, dtype=dtype),
+            audio2feat=lambda path: len(writes[-1]),
+            feature2chunks=lambda length, **kwargs:
+                [np.full((50, 384), 100.0, dtype=np.float32)] * (length * 25 // 16000),
+        )
+        runtime.pe = lambda features: features + 7  # Observe zeros BEFORE PE.
+        runtime.vae.decode_latents = lambda latents: [
+            np.full((256, 256, 3), int(value.item()), dtype=np.uint8) for value in latents[:, 0, 0]
+        ]
+
+        def datagen(chunks, latents, *, batch_size, device):
+            for start in range(0, len(chunks), batch_size):
+                batch = chunks[start:start + batch_size]
+                yield torch.stack(batch), torch.cat([latents[i % len(latents)] for i in range(start, start + len(batch))])
+
+        _module(monkeypatch, "musetalk.utils.utils", datagen=datagen)
+        _module(monkeypatch, "musetalk.utils.blending", get_image_blending=lambda frame, face, *args: face)
+        frame = np.zeros((256, 256, 3), dtype=np.uint8)
+        state = server.MuseTalkSessionState(
+            frame, (0, 0, 256, 256), [torch.zeros(1, 8, 2, 2)], [frame],
+            [frame[:, :, 0]], [(0, 0, 256, 256)],
+        )
+        return runtime, state, writes
+    return create
+
+
+def test_v15_silent_tail_converges_with_speech_context_and_reuses_session_cache(silence_runtime):
+    runtime, state, writes = silence_runtime()
+    speech = np.full(16000, 8192, dtype=np.int16)
+    first = runtime.render_chunk(state, speech, slice_len=25, fps=25)
+    assert not getattr(state, "closed_prediction_cache", {})
+    silence = runtime.render_chunk(state, np.zeros(16000, dtype=np.int16), slice_len=25, fps=25)
+    # Context remains real speech plus zeros; gate energy comes from current PCM.
+    np.testing.assert_array_equal(writes[-1][:16000], speech / 32768.0)
+    assert not writes[-1][16000:].any()
+    assert first[-1][176, 128, 0] == 107
+    assert silence[-1][176, 128, 0] < 20
+    assert silence[-1][0, 0, 0] == 107  # Keep non-mouth pixels from the normal prediction.
+    assert len(first) == len(silence) == 25
+    assert state.frame_cursor == 50
+    reference = state.closed_prediction_cache[0]
+    runtime.render_chunk(state, np.zeros(16000, dtype=np.int16), slice_len=25, fps=25)
+    resumed = runtime.render_chunk(state, speech, slice_len=25, fps=25)
+    assert state.closed_prediction_cache[0] is reference
+    assert resumed[-1][176, 128, 0] == 107
+    zero_reference_calls = [batch for batch in runtime.unet.model.seen if torch.all(batch == 7)]
+    assert len(zero_reference_calls) == 1
+    assert zero_reference_calls[0].shape == (1, 50, 384)
+    assert state.frame_cursor == 100
+
+
+def test_v15_mixed_speech_and_silence_only_gates_silent_frames(silence_runtime):
+    runtime, state, _ = silence_runtime()
+    pcm = np.concatenate([np.full(17 * 640, 8192, dtype=np.int16), np.zeros(8 * 640, dtype=np.int16)])
+    frames = runtime.render_chunk(state, pcm, slice_len=25, fps=25)
+    assert all(frame[176, 128, 0] == 107 for frame in frames[:17])
+    assert all(frame[176, 128, 0] < 20 for frame in frames[17:])
+    np.testing.assert_array_equal(server._compute_per_frame_energy(pcm / 32768.0, 25), [1] * 17 + [0] * 8)
+
+
 @pytest.mark.parametrize("version", ["v1", "v15"])
-@pytest.mark.parametrize(("tail_ms", "frames"), [(None, 8), (0, 0), (1000, 25)])
-def test_flush_infers_silence_preserves_session_and_close(
-    runtime_factory, monkeypatch, caplog, version, tail_ms, frames,
-):
-    runtime, _ = runtime_factory(version)
+def test_silence_gate_disabled_preserves_original_prediction(silence_runtime, monkeypatch, version):
+    monkeypatch.setenv("OMNIRT_MUSETALK_SILENCE_GATE", "0" if version == "v15" else "invalid-v15-only-setting")
+    runtime, state, _ = silence_runtime(version)
+    frames = runtime.render_chunk(state, np.zeros(16000, dtype=np.int16), slice_len=25, fps=25)
+    assert runtime.silence_gate == 0
+    assert not state.closed_prediction_cache
+    assert all(np.all(frame == 107) for frame in frames)
+
+
+def test_closed_reference_cache_is_session_local(silence_runtime):
+    runtime, first, _ = silence_runtime()
+    second = server.MuseTalkSessionState(
+        first.base_frame, first.face_box, first.latent_cycle, first.frame_cycle,
+        first.mask_cycle, first.mask_coords_cycle,
+    )
+    for state in (first, second):
+        runtime.render_chunk(state, np.zeros(16000, dtype=np.int16), slice_len=25, fps=25)
+    assert first.closed_prediction_cache is not second.closed_prediction_cache
+    assert first.closed_prediction_cache[0] is not second.closed_prediction_cache[0]
+    assert sum(bool(torch.all(batch == 7)) for batch in runtime.unet.model.seen) == 2
+
+
+def test_closed_mouth_blend_scales_with_gate_strength():
+    prediction = np.full((256, 256, 3), 200, dtype=np.uint8)
+    closed = np.full_like(prediction, 20)
+    full = server._blend_prediction_toward_closed_mouth(prediction, closed, 1.0)
+    half = server._blend_prediction_toward_closed_mouth(prediction, closed, 0.5)
+    assert full[176, 128, 0] < half[176, 128, 0] < prediction[176, 128, 0]
+    assert full[0, 0, 0] == half[0, 0, 0] == 200
+    assert server._blend_prediction_toward_closed_mouth(prediction, closed, 0.0) is prediction
+
+
+def test_ws_normal_audi_emits_corrected_silence_then_resumes_speech(silence_runtime, monkeypatch):
+    runtime, state, _ = silence_runtime()
     monkeypatch.setattr(server, "_RUNTIME", runtime)
-    if tail_ms is not None:
-        monkeypatch.setenv("OMNIRT_MUSETALK_TAIL_SILENCE_MS", str(tail_ms))
-    frame = np.full((16, 24, 3), 128, dtype=np.uint8)
-    state = SimpleNamespace(audio_context=np.ones(16000, dtype=np.int16))
-    prepare = Mock(return_value=state)
-    render = Mock(side_effect=lambda passed_state, pcm, **kw: [frame.copy() for _ in range(kw["slice_len"])])
-    monkeypatch.setattr(runtime, "prepare_session", prepare)
-    monkeypatch.setattr(runtime, "render_chunk", render)
-    ok, png = cv2.imencode(".png", frame)
+    runtime.prepare_session = Mock(return_value=state)
+    ok, png = cv2.imencode(".png", state.base_frame)
     assert ok
+    speech = np.full(16000, 8192, dtype=np.int16).tobytes()
     messages = [json.dumps({"type": "init", "ref_image": base64.b64encode(png).decode()}),
-                b"AUDI" + bytes(32000), json.dumps({"type": "flush"}),
-                b"AUDI" + bytes(32000), json.dumps({"type": "close"}),
-                b"AUDI" + bytes(32000), json.dumps({"type": "flush"})]
+                b"AUDI" + speech, b"AUDI" + bytes(32000), b"AUDI" + speech,
+                json.dumps({"type": "close"}), b"AUDI" + speech]
 
     class WebSocket:
         def __init__(self):
@@ -477,27 +544,22 @@ def test_flush_infers_silence_preserves_session_and_close(
             self.sent.append(message)
 
     ws = WebSocket()
-    with caplog.at_level(logging.INFO):
-        asyncio.run(server._handler(ws))
-    init = json.loads(ws.sent[0])
-    assert ("flush" in init.get("capabilities", [])) == (version == "v15")
-    expected = ["init_ok", 25] + ([frames] if frames else []) + ["flush_ok", 25, "close_ok", "error", "error"]
-    assert [struct.unpack_from("<I", m, 4)[0] if isinstance(m, bytes) else json.loads(m)["type"] for m in ws.sent] == expected
-    prepare.assert_called_once()
-    assert all(call.args[0] is state for call in render.call_args_list)
-    assert render.call_count == (3 if frames else 2)
-    if frames:
-        tail_call = render.call_args_list[1]
-        assert tail_call.args[1].dtype == np.int16
-        assert tail_call.args[1].size == int(16000 * (320 if tail_ms is None else tail_ms) / 1000)
-        assert not tail_call.args[1].any()
-        assert tail_call.kwargs == {"slice_len": frames, "fps": 25, "strict_frame_count": True}
-        assert ws.sent[2][:4] == b"VIDX"
-    assert "MuseTalk flush: tail=" in caplog.text
-    assert f"frames={frames}" in caplog.text
-
-
-@pytest.mark.parametrize(("raw", "expected"), [("-1", 0), ("1001", 1000), ("invalid", 320), ("39", 39)])
-def test_tail_silence_setting_is_bounded(monkeypatch, raw, expected):
-    monkeypatch.setenv("OMNIRT_MUSETALK_TAIL_SILENCE_MS", raw)
-    assert server._tail_silence_ms() == expected
+    asyncio.run(server._handler(ws))
+    assert "capabilities" not in json.loads(ws.sent[0])
+    last_frames = []
+    for payload in ws.sent[1:4]:
+        assert payload[:4] == b"VIDX" and struct.unpack_from("<I", payload, 4)[0] == 25
+        offset = 8
+        for _ in range(25):
+            size = struct.unpack_from("<I", payload, offset)[0]
+            jpeg = payload[offset + 4:offset + 4 + size]
+            offset += 4 + size
+        assert offset == len(payload)
+        last_frames.append(cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR))
+    assert last_frames[0][176, 128, 0] > 100
+    assert last_frames[1][176, 128, 0] < 20
+    assert last_frames[2][176, 128, 0] > 100
+    runtime.prepare_session.assert_called_once()
+    assert state.frame_cursor == 75
+    assert json.loads(ws.sent[4]) == {"type": "close_ok"}
+    assert json.loads(ws.sent[5])["type"] == "error"
