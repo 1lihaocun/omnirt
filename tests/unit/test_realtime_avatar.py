@@ -640,14 +640,25 @@ def test_fasterliveportrait_applies_stitching_config_before_preparing_source(
     assert len(decode_jpeg_sequence(payload)) == 1
 
 
-def test_fasterliveportrait_render_keyframes_expand_to_emit_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fasterliveportrait_render_keyframes_expand_to_emit_frames(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     runtime = FasterLivePortraitRealtimeRuntime(load_models=False)
+    runtime.fasterliveportrait_root = tmp_path
     service = RealtimeAvatarService(runtime=runtime)
     session = service.create_session(
         model=FASTLIVEPORTRAIT_MODEL_ID,
         backend="cpu-stub",
         image_bytes=b"fake-image-bytes",
-        config={"chunk_samples": 8000, "emit_frames_per_chunk": 16, "render_keyframes_per_chunk": 4, "width": 32, "height": 32},
+        config={
+            "chunk_samples": 8000,
+            "emit_frames_per_chunk": 16,
+            "render_keyframes_per_chunk": 4,
+            "boundary_blend_frames": 3,
+            "width": 32,
+            "height": 32,
+        },
     )
     state = runtime._session_state(session)
 

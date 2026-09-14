@@ -1130,6 +1130,14 @@ class FasterLivePortraitRealtimeRuntime:
             return default
 
     @staticmethod
+    def _int_config(session: RealtimeAvatarSession, key: str, default: int) -> int:
+        raw = session.runtime_config.get(key, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _bool_config(session: RealtimeAvatarSession, key: str, default: bool) -> bool:
         raw = session.runtime_config.get(key, default)
         if isinstance(raw, bool):
