@@ -45,6 +45,7 @@ class FasterLivePortraitSessionState:
     source_path: str | None = None
     source_prepared: bool = False
     reference_frame: np.ndarray | None = None
+    last_output_jpeg: bytes | None = None
     driving_frame_index: int = 0
     first_chunk_at: float = field(default_factory=time.monotonic)
 
@@ -241,6 +242,19 @@ class FasterLivePortraitRealtimeRuntime:
             expand_t0 = time.monotonic()
             jpeg_frames = self._expand_keyframes(keyframe_jpegs, emit_frames)
             encode_ms += (time.monotonic() - expand_t0) * 1000.0
+        boundary_blend_frames = max(
+            0,
+            self._int_config(session, "boundary_blend_frames", 0),
+        )
+        boundary_blend_t0 = time.monotonic()
+        jpeg_frames = self._blend_chunk_boundary_jpegs(
+            state.last_output_jpeg,
+            jpeg_frames,
+            blend_frames=boundary_blend_frames,
+        )
+        encode_ms += (time.monotonic() - boundary_blend_t0) * 1000.0
+        if jpeg_frames:
+            state.last_output_jpeg = jpeg_frames[-1]
         render_encode_ms = (time.monotonic() - render_t0) * 1000.0
 
         state.emitted_frames += len(jpeg_frames)
@@ -1035,6 +1049,34 @@ class FasterLivePortraitRealtimeRuntime:
             buffer = io.BytesIO()
             image.save(buffer, format="JPEG", quality=self.jpeg_quality)
             out.append(buffer.getvalue())
+        return out
+
+    def _blend_chunk_boundary_jpegs(
+        self,
+        previous_jpeg: bytes | None,
+        jpeg_frames: list[bytes],
+        *,
+        blend_frames: int,
+    ) -> list[bytes]:
+        """Cross-fade the start of a chunk to hide independent-model boundary jumps."""
+
+        if previous_jpeg is None or not jpeg_frames or blend_frames <= 0:
+            return jpeg_frames
+        previous = self._decode_rgb_image(previous_jpeg)
+        if previous is None:
+            return jpeg_frames
+        out = list(jpeg_frames)
+        count = min(len(out), int(blend_frames))
+        for idx in range(count):
+            current = self._decode_rgb_image(out[idx])
+            if current is None or current.shape != previous.shape:
+                return jpeg_frames
+            alpha = float(idx + 1) / float(count)
+            blended = previous.astype(np.float32) * (1.0 - alpha) + current.astype(np.float32) * alpha
+            image = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=self.jpeg_quality)
+            out[idx] = buffer.getvalue()
         return out
 
     def _placeholder_jpeg(

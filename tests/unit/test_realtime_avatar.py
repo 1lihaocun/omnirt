@@ -1101,6 +1101,31 @@ def test_fasterliveportrait_interpolates_repeated_keyframe_jpegs() -> None:
     assert reds[0] < reds[1] < reds[2] < reds[3] < reds[4]
 
 
+def test_fasterliveportrait_blends_the_start_of_each_chunk_with_the_previous_frame() -> None:
+    runtime = FasterLivePortraitRealtimeRuntime(load_models=False)
+
+    def jpeg(red: int) -> bytes:
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), (red, 0, 0)).save(buffer, format="JPEG", quality=95)
+        return buffer.getvalue()
+
+    frames = runtime._blend_chunk_boundary_jpegs(
+        jpeg(0),
+        [jpeg(120), jpeg(150), jpeg(180), jpeg(210)],
+        blend_frames=3,
+    )
+    reds = [
+        int(np.asarray(Image.open(io.BytesIO(frame)).convert("RGB"))[0, 0, 0])
+        for frame in frames
+    ]
+
+    assert len(frames) == 4
+    assert 30 <= reds[0] <= 50
+    assert 90 <= reds[1] <= 110
+    assert 170 <= reds[2] <= 190
+    assert 200 <= reds[3] <= 220
+
+
 def test_fasterliveportrait_prefers_dynamic_crop_when_org_is_static(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = FasterLivePortraitRealtimeRuntime(load_models=False)
     service = RealtimeAvatarService(runtime=runtime)
@@ -1269,6 +1294,8 @@ def test_fasterliveportrait_compatible_ws_init_generate_and_close() -> None:
                 "ref_image": _image_b64(),
                 "chunk_samples": 8000,
                 "emit_frames_per_chunk": 12,
+                "render_keyframes_per_chunk": 6,
+                "boundary_blend_frames": 3,
                 "head_motion_multiplier": 1.0,
                 "pose_motion_multiplier": 0.4,
                 "animation_region": "lip",
@@ -1288,6 +1315,8 @@ def test_fasterliveportrait_compatible_ws_init_generate_and_close() -> None:
         assert init["chunk_samples"] == 8000
         session_id = next(iter(app.state.realtime_avatar_service._sessions))
         session = app.state.realtime_avatar_service._sessions[session_id]
+        assert session.runtime_config["render_keyframes_per_chunk"] == 6
+        assert session.runtime_config["boundary_blend_frames"] == 3
         assert session.runtime_config["pose_motion_multiplier"] == 0.4
         assert session.runtime_config["animation_region"] == "lip"
         assert session.runtime_config["mouth_open_multiplier"] == 2.0
