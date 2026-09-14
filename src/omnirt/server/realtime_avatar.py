@@ -559,6 +559,7 @@ class RealtimeAvatarService:
             "emit_frames_per_chunk",
             "render_keyframes_per_chunk",
             "disable_frame_interpolation",
+            "boundary_blend_frames",
             "yaw_multiplier",
             "pitch_multiplier",
             "roll_multiplier",

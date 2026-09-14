@@ -123,8 +123,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "fps": args.fps,
         "chunk_samples": args.chunk_samples,
         "emit_frames_per_chunk": args.emit_frames,
-        "render_keyframes_per_chunk": args.emit_frames,
-        "disable_frame_interpolation": True,
+        "render_keyframes_per_chunk": args.render_keyframes,
+        "disable_frame_interpolation": not args.frame_interpolation,
+        "boundary_blend_frames": args.boundary_blend_frames,
         "head_motion_multiplier": args.head_motion_multiplier,
         "pose_motion_multiplier": args.pose_motion_multiplier,
         "yaw_multiplier": args.yaw_multiplier,
@@ -213,6 +214,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--duration", type=float, default=6.0, help="Audio duration to synthesize when --chunks is not set.")
     parser.add_argument("--chunk-samples", type=int, default=16000)
     parser.add_argument("--emit-frames", type=int)
+    parser.add_argument("--render-keyframes", type=int)
+    parser.add_argument("--frame-interpolation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--boundary-blend-frames", type=int, default=0)
     parser.add_argument("--chunks", type=int)
     parser.add_argument("--head-motion-multiplier", type=float, default=0.3)
     parser.add_argument("--pose-motion-multiplier", type=float, default=0.35)
@@ -235,6 +239,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.chunks = max(1, int(math.ceil(args.duration / chunk_seconds)))
     if args.emit_frames is None:
         args.emit_frames = max(1, int(round(args.fps * chunk_seconds)))
+    if args.render_keyframes is None:
+        args.render_keyframes = 6 if args.frame_interpolation else args.emit_frames
+    args.render_keyframes = max(1, min(args.emit_frames, args.render_keyframes))
+    args.boundary_blend_frames = max(0, args.boundary_blend_frames)
     return args
 
 

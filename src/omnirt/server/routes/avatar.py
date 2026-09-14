@@ -181,7 +181,9 @@ def _fasterliveportrait_config_from_payload(payload: dict[str, Any]) -> dict[str
         "head_only_pasteback",
         "lookahead_ms",
         "emit_frames_per_chunk",
+        "render_keyframes_per_chunk",
         "disable_frame_interpolation",
+        "boundary_blend_frames",
         "flag_crop_driving_video",
     ):
         if payload.get(key) is not None:
