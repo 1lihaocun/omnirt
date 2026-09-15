@@ -15,7 +15,9 @@ services:
       OMNIRT_QUICKTALK_MODEL_ROOT: /tmp/opentalking/quicktalk-model
       OMNIRT_QUICKTALK_CHECKPOINT: /models/quicktalk/checkpoints/quicktalk.pth
       OMNIRT_QUICKTALK_TEMPLATE_CACHE_DIR: /tmp/opentalking/quicktalk-cache
-      OMNIRT_QUICKTALK_WORKER_CACHE_MAX: "1"
+      # Two distinct QuickTalk references may overlap with platform rendering.
+      # A single cached worker evicts on every alternating audio chunk.
+      OMNIRT_QUICKTALK_WORKER_CACHE_MAX: ${OMNIRT_QUICKTALK_WORKER_CACHE_MAX:-2}
       OMNIRT_QUICKTALK_MAX_TEMPLATE_SECONDS: "1"
       OMNIRT_QUICKTALK_MAX_LONG_EDGE: "900"
       OMNIRT_FASTLIVEPORTRAIT_RUNTIME: "1"
