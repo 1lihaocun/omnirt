@@ -1,0 +1,65 @@
+name: digital-human-omnirt-avatar
+
+services:
+  avatar-ws:
+    image: ${OMNIRT_AVATAR_IMAGE:?Set OMNIRT_AVATAR_IMAGE to the verified image tag}
+    container_name: omnirt-avatar-ws
+    restart: unless-stopped
+    init: true
+    gpus: all
+    shm_size: "1gb"
+    environment:
+      OMNIRT_QUICKTALK_RUNTIME: "1"
+      OMNIRT_QUICKTALK_DEVICE: cuda:0
+      OMNIRT_QUICKTALK_HUBERT_DEVICE: cuda:0
+      OMNIRT_QUICKTALK_MODEL_ROOT: /tmp/opentalking/quicktalk-model
+      OMNIRT_QUICKTALK_CHECKPOINT: /models/quicktalk/checkpoints/quicktalk.pth
+      OMNIRT_QUICKTALK_TEMPLATE_CACHE_DIR: /tmp/opentalking/quicktalk-cache
+      OMNIRT_QUICKTALK_WORKER_CACHE_MAX: "1"
+      OMNIRT_QUICKTALK_MAX_TEMPLATE_SECONDS: "1"
+      OMNIRT_QUICKTALK_MAX_LONG_EDGE: "900"
+      OMNIRT_FASTLIVEPORTRAIT_RUNTIME: "1"
+      OMNIRT_FASTLIVEPORTRAIT_LOAD_MODELS: "1"
+      OMNIRT_FASTLIVEPORTRAIT_ROOT: /opt/FasterLivePortrait
+      OMNIRT_FASTLIVEPORTRAIT_CHECKPOINTS_DIR: /opt/FasterLivePortrait/checkpoints
+      OMNIRT_FASTLIVEPORTRAIT_DEVICE: cuda:0
+      OMNIRT_FASTLIVEPORTRAIT_CFG: configs/trt_infer.yaml
+      OMNIRT_FASTLIVEPORTRAIT_WORK_DIR: /tmp/opentalking/omnirt-work
+      OMNIRT_ALLOWED_FRAME_ROOTS: /tmp/opentalking/avatars
+      OMNIRT_PERF_LOG: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      # JoyVASA's fixed, trusted legacy checkpoint contains argparse.Namespace.
+      # PyTorch 2.6 otherwise rejects its implicit torch.load(weights_only).
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
+    volumes:
+      - ${OMNIRT_SHARED_ROOT:?Set OMNIRT_SHARED_ROOT}:/tmp/opentalking
+      - ${OMNIRT_QUICKTALK_CHECKPOINTS_ROOT:?Set OMNIRT_QUICKTALK_CHECKPOINTS_ROOT}:/models/quicktalk/checkpoints:ro
+      - ${OMNIRT_FASTLIVEPORTRAIT_CHECKPOINTS_ROOT:?Set OMNIRT_FASTLIVEPORTRAIT_CHECKPOINTS_ROOT}:/opt/FasterLivePortrait/checkpoints:ro
+    networks:
+      - inference
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, urllib.request
+          urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=5)
+          data = json.load(urllib.request.urlopen('http://127.0.0.1:9000/v1/audio2video/models', timeout=5))
+          statuses = {item['id']: item['connected'] for item in data['statuses']}
+          assert statuses.get('quicktalk') and statuses.get('fasterliveportrait'), statuses
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  inference:
+    external: true
+    name: ${OMNIRT_MODEL_NETWORK:-digital-human-flashhead-inference}
